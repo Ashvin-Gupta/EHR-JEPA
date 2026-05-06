@@ -1,0 +1,137 @@
+# EHR-JEPA configuration
+#
+# All paths can be absolute or relative to the project root.
+# Entries marked "reserved" are not yet active but are read by the code
+# so they can be toggled without changing source files.
+
+# Set to an integer to fix all random seeds (Python, NumPy, PyTorch, CUDA).
+# Set to null to run non-deterministically.
+seed: 42
+
+data:
+  # Root directory containing train/, tuning/, held_out/ sub-folders of
+  # .parquet files.
+  data_dir: "/home/ag619/clean_meds"
+
+  # Directory containing MIMIC lookup tables used by MEDSCodeTranslator.
+  # Set to null if lookup files are not available (translator falls back
+  # to raw code strings).
+  lookup_dir: "/home/ag619/MIMIC_data/hosp"  # d_labitems.csv.gz, d_icd_diagnoses.csv.gz, etc.
+
+  # Where the built vocabulary is saved / loaded from.
+  vocab_path: "/home/ag619/EHR-JEPA-Data/vocab.json"
+
+  # ACES-format label file (parquet or csv) with columns:
+  #   subject_id, prediction_time, label
+  # Required when training.task == "prediction"; ignored for pretrain.
+  aces_label_path: null
+
+wandb:
+  enabled: true
+  project: "EHR-JEPA"
+  entity: null          # set to your W&B username or team name, e.g. "my-team"
+
+normalizer:
+  # Path where fitted normalizer statistics are saved / loaded.
+  stats_path: "/home/ag619/EHR-JEPA-Data/normalizer_stats.json"
+
+model:
+  # Transformer hidden dimension.  All embedding outputs have this size.
+  d_model: 256
+
+  # Embedding mode:
+  #   "learned"    — trainable nn.Embedding table, top-5000 vocab + UNK.
+  #   "text_based" — frozen ClinicalBERT/BioBERT embeddings + trainable
+  #                  linear projection (encoder_hidden_dim → d_model).
+  embedding_type: "text_based"           # "learned" | "text_based"
+
+  # HuggingFace model name used by scripts/encode_text_embeddings.py.
+  # Only relevant for text_based; ignored for learned.
+  text_encoder: "emilyalsentzer/Bio_ClinicalBERT"
+
+  # Path to the precomputed embedding tensor (.pt file, shape [vocab_size, hidden_dim]).
+  # Required when embedding_type == "text_based".
+  code_embeddings_path: "/home/ag619/EHR-JEPA-Data/code_embeddings.pt"
+
+  # Hidden dimension of the text encoder (e.g. 768 for BERT-base).
+  # Must match the shape of the .pt file when embedding_type == "text_based".
+  encoder_hidden_dim: 768
+
+  # Number of codes to keep when embedding_type == "learned".
+  # Ignored when embedding_type == "text_based" (all unique codes are used).
+  vocab_size: 5000
+
+  # --- Feature flags (four modes) ---
+  #   use_value: false, use_time: false  →  code only         (no MLP, no normalizer)
+  #   use_value: true,  use_time: false  →  code + value      (MLP: d_model+3)
+  #   use_value: false, use_time: true   →  code + time       (MLP: d_model+1)
+  #   use_value: true,  use_time: true   →  code + value + time (MLP: d_model+4)
+  use_value: true
+  use_time: false
+
+masking:
+  mask_ratio: 0.30
+  default_num_spans: 4
+  min_span_length: 15
+
+transformer:
+  n_layers: 6
+  n_heads: 8
+  ffn_dim: 1024
+  dropout: 0.1
+  # Context pathway always uses compact extraction with original RoPE position IDs.
+  # (context_encoding option removed — extracted_with_positions is now the only mode.)
+
+predictor:
+  n_layers: 2
+  n_heads: 8
+  # Branch selection:
+  #   true  — Perceiver-JEPA: cross-attention pooling to fixed latents, latent predictor
+  #   false — Token I-JEPA:   MASK tokens concat with context, token predictor
+  use_perceiver: false
+  # Branch A only: skip target spans shorter than this many tokens
+  min_span_for_perceiver: 15
+
+latent_pooling:
+  n_latents: 16
+
+loss:
+  lambda_cov: 0.1
+  cov_proj_dim: 64
+
+training:
+  # "pretrain"   — full-sequence JEPA masked pretraining.
+  # "prediction" — downstream fine-tuning with ACES labels.
+  task: "pretrain"
+
+  # Transformer context window.  Also used for collator windowing / padding.
+  max_seq_len: 512
+
+  batch_size: 32
+
+  # Unit for delta_time before log(1 + x) transform.
+  # Only relevant when model.use_time: true.
+  time_unit: "hours"
+
+  # ---- Optimiser ----
+  lr: 1.0e-4
+  weight_decay: 1.0e-2      # L2 regularisation via AdamW
+
+  # ---- LR Scheduler ----
+  # Options: "cosine_warmup" | "cosine" | "linear_warmup" | "none"
+  # cosine_warmup: linear warm-up for warmup_ratio of steps, then cosine decay
+  # cosine:        cosine decay from step 0 (no warm-up)
+  # linear_warmup: linear warm-up then constant lr
+  scheduler: "cosine_warmup"
+  warmup_ratio: 0.05         # fraction of total steps used for warm-up
+  min_lr_ratio: 0.1          # lr decays to min_lr_ratio * lr at end of training
+
+  # ---- Gradient clipping ----
+  grad_clip: 1.0             # max gradient norm; set to 0 to disable
+
+  # ---- Early stopping ----
+  early_stopping_patience: 5   # epochs without improvement before stopping
+                                # set to 0 to disable
+  early_stopping_metric: "val_loss"   # "val_loss" or "train_loss"
+
+  n_epochs: 10
