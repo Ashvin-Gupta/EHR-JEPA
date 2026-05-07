@@ -138,6 +138,12 @@ class JEPATrainer(nn.Module):
         d_model = encoder.config.d_model
         self.mask_token = nn.Parameter(torch.zeros(d_model))
 
+        # Side-channel populated during each forward() call.
+        # The train loop reads these after calling self.forward() so monitoring
+        # metrics from inside the forward (target std-dev, mask ratio) are
+        # available without changing the public return signature to 5+ values.
+        self._batch_mon: Dict[str, float] = {}
+
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
@@ -150,6 +156,7 @@ class JEPATrainer(nn.Module):
         z_scores: Optional[torch.Tensor] = None,
         delta_times: Optional[torch.Tensor] = None,
         value_mask: Optional[torch.Tensor] = None,
+        pre_mask: Optional[Dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Parameters
@@ -160,10 +167,15 @@ class JEPATrainer(nn.Module):
         z_scores:        FloatTensor (B, L) | None
         delta_times:     FloatTensor (B, L) | None
         value_mask:      LongTensor  (B, L) | None
+        pre_mask:        dict with keys 'mask_context_indices', 'mask_target_spans',
+                         'mask_span_times' (pre-computed by MEDSCollator in worker
+                         process).  When None the masker is run here on the main thread.
 
         Returns
         -------
-        (L_pred, L_cov, L_total) — scalar tensors
+        (L_pred, L_cov, L_total) — scalar tensors.
+        Also populates self._batch_mon with monitoring scalars (no extra GPU→CPU
+        transfers — values are already detached floats).
         """
         B, L = codes.shape
         device = codes.device
@@ -177,26 +189,36 @@ class JEPATrainer(nn.Module):
             value_mask=value_mask.float() if value_mask is not None else None,
         )  # (B, L, d)
 
-        # 2. Per-sample masking
-        all_context_indices: List[List[int]] = []
-        all_target_spans: List[List[List[int]]] = []
-        all_span_times: List[List[Tuple[float, float]]] = []
-
-        for b in range(B):
-            result = self.masker(
-                seq_len=L,
-                attention_mask=attention_mask[b],
-                times=None,
-            )
-            all_context_indices.append(result.context_indices)
-            all_target_spans.append(result.target_spans)
-            all_span_times.append(result.span_times)
+        # 2. Span masking — use pre-computed results from the DataLoader worker
+        #    when available; fall back to on-the-fly masking otherwise.
+        if pre_mask is not None:
+            all_context_indices: List[List[int]] = pre_mask["mask_context_indices"]
+            all_target_spans: List[List[List[int]]] = pre_mask["mask_target_spans"]
+            all_span_times: List[List[Tuple[float, float]]] = pre_mask["mask_span_times"]
+        else:
+            all_context_indices = []
+            all_target_spans = []
+            all_span_times = []
+            for b in range(B):
+                result = self.masker(
+                    seq_len=L,
+                    attention_mask=attention_mask[b],
+                    times=None,
+                )
+                all_context_indices.append(result.context_indices)
+                all_target_spans.append(result.target_spans)
+                all_span_times.append(result.span_times)
 
         # Use minimum num_spans across batch for uniform tensors
         num_spans_per_sample = [len(spans) for spans in all_target_spans]
         num_spans = min(num_spans_per_sample) if num_spans_per_sample else 0
         if num_spans == 0:
             zero = x.new_zeros(())
+            self._batch_mon = {
+                "std_dev_embeddings": 0.0, "rank_me": 0.0,
+                "_N_input": 0, "_N_target": 0, "_N_context": 0,
+                "avg_context_length": 0.0, "avg_target_span_length": 0.0,
+            }
             return zero, zero, zero
 
         all_target_spans = [spans[:num_spans] for spans in all_target_spans]
@@ -228,6 +250,64 @@ class JEPATrainer(nn.Module):
             )
 
         l_total = l_pred + self.config.lambda_cov * l_cov
+
+        # --- Monitoring metrics (detached, no overhead) ---
+        # Average std-dev across target-span embedding dimensions
+        # (collapse indicator: should stay well above 0)
+        with torch.no_grad():
+            if target_spans_list:
+                all_tgt = torch.cat(
+                    [t.reshape(-1, t.shape[-1]) for t in target_spans_list], dim=0
+                )  # (N, d)
+                std_dev = all_tgt.std(dim=0).mean().item()
+                # RankMe per-batch: subsample ≤512 rows so SVD stays fast
+                z_sample = all_tgt[:512].float()
+                try:
+                    _, s, _ = torch.linalg.svd(z_sample, full_matrices=False)
+                    p = s / (s.sum() + 1e-8)
+                    rank_me = float(torch.exp(-(p * torch.log(p + 1e-8)).sum()).item())
+                except Exception:
+                    rank_me = 0.0
+            else:
+                all_tgt = x.new_zeros((1, x.shape[-1]))
+                std_dev = 0.0
+                rank_me = 0.0
+
+        # Raw token counts — ratios are computed in the train loop where
+        # orig_seq_lengths (N_total) is also available.
+        B_size       = attention_mask.shape[0]
+        N_model      = int(attention_mask.sum().item())   # real tokens after windowing
+        N_target     = sum(
+            sum(len(span) for span in spans)
+            for spans in all_target_spans
+        )
+        N_context    = N_model - N_target
+
+        # Average context length per sample
+        avg_ctx_len = sum(len(ctx) for ctx in all_context_indices) / max(B_size, 1)
+
+        # Average length of each individual target span
+        all_span_lengths = [
+            len(span)
+            for spans in all_target_spans
+            for span in spans
+        ]
+        avg_tgt_span_len = sum(all_span_lengths) / max(len(all_span_lengths), 1)
+
+        self._batch_mon = {
+            "std_dev_embeddings":     std_dev,
+            "rank_me":                rank_me,
+            # Raw token counts (batch-level sums) for ratio computation in train loop:
+            #   target_ratio  = N_target / N_input   (~30%, matches mask_ratio config)
+            #   context_ratio = N_context / N_total  (fraction of original traj used as context)
+            "_N_input":               N_model,    # min(N_total, N_model) real tokens
+            "_N_target":              N_target,   # tokens masked (all spans combined)
+            "_N_context":             N_context,  # unmasked tokens fed to context encoder
+            "avg_context_length":     avg_ctx_len,
+            "avg_target_span_length": avg_tgt_span_len,
+            "_tgt_embs_for_rank": all_tgt.detach() if not self.training else None,
+        }
+
         return l_pred, l_cov, l_total
 
     # ------------------------------------------------------------------
@@ -566,6 +646,7 @@ class JEPATrainer(nn.Module):
         print(f"[train] Scheduler:       {cfg.scheduler}")
         print(f"[train] Grad clip:       {cfg.grad_clip if cfg.grad_clip > 0 else 'disabled'}")
         print(f"[train] Weight decay:    {cfg.weight_decay}")
+        print(f"[train] lambda_cov:      {cfg.lambda_cov}")
         print(f"[train] Early stopping:  "
               f"{'disabled' if cfg.early_stopping_patience == 0 else f'patience={cfg.early_stopping_patience}, metric={cfg.early_stopping_metric}'}")
         print()
@@ -578,7 +659,11 @@ class JEPATrainer(nn.Module):
             epoch_l_cov  = 0.0
             n_batches    = 0
 
+            import time as _time
+
             for batch in train_loader:
+                t0 = _time.perf_counter()
+
                 codes       = batch["codes"].to(device)
                 attn_mask   = batch["attention_mask"].to(device)
                 values      = batch.get("values")
@@ -591,9 +676,23 @@ class JEPATrainer(nn.Module):
                 if delta_times is not None: delta_times = delta_times.to(device)
                 if value_mask  is not None: value_mask  = value_mask.to(device)
 
+                # Pre-computed masking from the DataLoader worker (plain Python
+                # lists — they stay on CPU, never move to device).
+                pre_mask = (
+                    {
+                        "mask_context_indices": batch["mask_context_indices"],
+                        "mask_target_spans":    batch["mask_target_spans"],
+                        "mask_span_times":      batch["mask_span_times"],
+                    }
+                    if "mask_context_indices" in batch else None
+                )
+
+                orig_seq_lengths = batch.get("orig_seq_lengths")
+
                 optimizer.zero_grad()
                 l_pred, l_cov, l_total = self.forward(
-                    codes, attn_mask, values, z_scores, delta_times, value_mask
+                    codes, attn_mask, values, z_scores, delta_times, value_mask,
+                    pre_mask=pre_mask,
                 )
                 l_total.backward()
 
@@ -607,22 +706,65 @@ class JEPATrainer(nn.Module):
                 if scheduler is not None:
                     scheduler.step()
 
-                current_lr   = optimizer.param_groups[0]["lr"]
-                batch_loss   = l_total.item()
-                epoch_loss  += batch_loss
+                elapsed = _time.perf_counter() - t0
+                batch_size = codes.shape[0]
+
+                current_lr    = optimizer.param_groups[0]["lr"]
+                batch_loss    = l_total.item()
+                epoch_loss   += batch_loss
                 epoch_l_pred += l_pred.item()
                 epoch_l_cov  += l_cov.item()
-                n_batches   += 1
-                global_step += 1
+                n_batches    += 1
+                # Fractional epoch: e.g. 1.45 = 45% through epoch 2
+                total_batches  = len(train_loader)
+                epoch_progress = epoch + n_batches / max(total_batches, 1)
+                global_step  += 1
 
                 if on_batch_end is not None:
-                    on_batch_end(epoch, global_step, {
-                        "batch_loss":   batch_loss,
-                        "batch_l_pred": l_pred.item(),
-                        "batch_l_cov":  l_cov.item(),
-                        "lr":           current_lr,
-                        "grad_norm":    grad_norm,
-                    })
+                    batch_metrics = {
+                        "epoch":       epoch_progress,
+                        # --- Panel: Loss Components ---
+                        "loss_total":  batch_loss,
+                        "loss_pred":   l_pred.item(),
+                        "loss_cov":    l_cov.item(),
+                        # --- Panel: Optimization & Hardware ---
+                        "learning_rate":       current_lr,
+                        "grad_norm":           grad_norm,
+                        "samples_per_second":  batch_size / max(elapsed, 1e-6),
+                        # --- Panel: Representation Health ---
+                        "std_dev_embeddings":  self._batch_mon.get("std_dev_embeddings", 0.0),
+                        "rank_me":             self._batch_mon.get("rank_me", 0.0),
+                        # --- Panel: Medical Context ---
+                        # N_total: original trajectory length (pre-windowing)
+                        # N_context / N_target: computed after masking
+                        "avg_seq_length": (
+                            orig_seq_lengths.float().mean().item()
+                            if orig_seq_lengths is not None
+                            else attn_mask.sum(1).float().mean().item()
+                        ),
+                        "avg_context_length":    self._batch_mon.get("avg_context_length", 0.0),
+                        "avg_target_span_length": self._batch_mon.get("avg_target_span_length", 0.0),
+                        # Definitions (batch-level sums):
+                        #   N_representation = min(N_total, N_model) — fed to encoder
+                        #   N_targets  = mask_ratio × N_representation
+                        #   N_context  = N_representation − N_targets
+                        #
+                        #   target_ratio  = N_targets / N_context
+                        #   context_ratio = N_context / N_total
+                        "target_ratio": (
+                            self._batch_mon.get("_N_target", 0)
+                            / max(self._batch_mon.get("_N_context", 1), 1)
+                        ),
+                        "context_ratio": (
+                            self._batch_mon.get("_N_context", 0)
+                            / max(
+                                int(orig_seq_lengths.sum().item()) if orig_seq_lengths is not None
+                                else self._batch_mon.get("_N_input", 1),
+                                1,
+                            )
+                        ),
+                    }
+                    on_batch_end(epoch, global_step, batch_metrics)
 
             avg_train  = epoch_loss   / max(n_batches, 1)
             avg_l_pred = epoch_l_pred / max(n_batches, 1)
@@ -632,21 +774,21 @@ class JEPATrainer(nn.Module):
             history["lr"].append(current_lr)
 
             epoch_metrics: Dict[str, float] = {
-                "epoch":        epoch + 1,
-                "global_step":  global_step,
-                "train_loss":   avg_train,
-                "train_l_pred": avg_l_pred,
-                "train_l_cov":  avg_l_cov,
-                "lr":           current_lr,
+                "global_step": global_step,
             }
 
             val_line = ""
             if val_loader is not None:
                 print(f"  [val] Running validation … ", end="", flush=True)
-                avg_val = self._eval_epoch(val_loader, device)
-                print(f"val_loss={avg_val:.4f}")
+                avg_val, val_metrics = self._eval_epoch(val_loader, device)
+                print(
+                    f"val_loss={avg_val:.4f}"
+                    f"  std_dev={val_metrics.get('std_dev_embeddings', 0.0):.4f}"
+                    f"  rank_me={val_metrics.get('rank_me', 0.0):.1f}"
+                )
                 history["val_loss"].append(avg_val)
                 epoch_metrics["val_loss"] = avg_val
+                epoch_metrics.update(val_metrics)
                 val_line = f"  val={avg_val:.4f}"
 
             print(
@@ -683,9 +825,28 @@ class JEPATrainer(nn.Module):
         return history
 
     @torch.no_grad()
-    def _eval_epoch(self, loader: DataLoader, device: torch.device) -> float:
+    def _eval_epoch(
+        self,
+        loader: DataLoader,
+        device: torch.device,
+        rank_me_max_samples: int = 2048,
+    ) -> Tuple[float, Dict[str, float]]:
+        """
+        Returns
+        -------
+        (avg_loss, val_metrics_dict)
+
+        val_metrics_dict keys:
+          unique_codes_seen : number of distinct vocabulary IDs in this val epoch
+          rank_me           : effective rank estimate of target embeddings
+                              (exp of entropy over singular values; higher = richer)
+        """
         self.eval()
         total, n = 0.0, 0
+        std_dev_sum   = 0.0
+        emb_buffer: List[torch.Tensor] = []
+        emb_collected = 0
+
         for batch in loader:
             codes       = batch["codes"].to(device)
             attn_mask   = batch["attention_mask"].to(device)
@@ -697,9 +858,50 @@ class JEPATrainer(nn.Module):
             if z_scores    is not None: z_scores    = z_scores.to(device)
             if delta_times is not None: delta_times = delta_times.to(device)
             if value_mask  is not None: value_mask  = value_mask.to(device)
+            pre_mask = (
+                {
+                    "mask_context_indices": batch["mask_context_indices"],
+                    "mask_target_spans":    batch["mask_target_spans"],
+                    "mask_span_times":      batch["mask_span_times"],
+                }
+                if "mask_context_indices" in batch else None
+            )
+
             _, _, l_total = self.forward(
-                codes, attn_mask, values, z_scores, delta_times, value_mask
+                codes, attn_mask, values, z_scores, delta_times, value_mask,
+                pre_mask=pre_mask,
             )
             total += l_total.item()
             n += 1
-        return total / max(n, 1)
+
+            std_dev_sum += self._batch_mon.get("std_dev_embeddings", 0.0)
+
+            # Collect target embeddings for epoch-level RankMe
+            if emb_collected < rank_me_max_samples:
+                tgt_embs = self._batch_mon.get("_tgt_embs_for_rank")
+                if tgt_embs is not None:
+                    tgt_embs = tgt_embs.cpu()
+                    need = rank_me_max_samples - emb_collected
+                    take = min(need, tgt_embs.shape[0])
+                    emb_buffer.append(tgt_embs[:take])
+                    emb_collected += take
+
+        avg_loss   = total       / max(n, 1)
+        avg_std_dev = std_dev_sum / max(n, 1)
+
+        # RankMe over accumulated val embeddings (more stable than per-batch)
+        rank_me_val = 0.0
+        if emb_buffer:
+            z_all = torch.cat(emb_buffer, dim=0).float()
+            try:
+                _, s, _ = torch.linalg.svd(z_all, full_matrices=False)
+                p = s / (s.sum() + 1e-8)
+                rank_me_val = float(torch.exp(-(p * torch.log(p + 1e-8)).sum()).item())
+            except Exception:
+                rank_me_val = 0.0
+
+        val_metrics: Dict[str, float] = {
+            "std_dev_embeddings": avg_std_dev,
+            "rank_me":            rank_me_val,
+        }
+        return avg_loss, val_metrics

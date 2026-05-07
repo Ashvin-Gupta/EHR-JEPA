@@ -1,6 +1,16 @@
 """
 PyTorch Dataset for MEDS-format EHR data.
 
+Data storage
+------------
+The full split is stored as a single polars DataFrame (self._df) with a
+compact subject_id → (start_row, end_row) index (self._row_index).
+
+Event objects are created lazily in __getitem__ for ONE subject at a time,
+not for the entire split at startup.  This avoids:
+  • 20-minute upfront Python loops over 50 M rows
+  • 10–20 GB pickle files that bust disk quotas
+
 Two task modes:
 
   "pretrain"   — one sample per subject, full event sequence returned as-is.
@@ -29,18 +39,18 @@ from __future__ import annotations
 
 import math
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 from torch.utils.data import Dataset
 
 from data.meds_parser import (
     Event,
-    build_subject_sequences,
     extract_header,
     get_age_from_header,
     is_header_code,
-    load_split,
+    df_slice_to_events,
+    load_or_build_polars_cache,
 )
 from data.normalizer import ValueNormalizer
 from data.vocab import Vocab
@@ -59,18 +69,22 @@ class MEDSDataset(Dataset):
     task:
         "pretrain" or "prediction".
     max_seq_len:
-        Maximum sequence length used for header-preserving truncation in
-        prediction mode.  In pretrain mode the full sequence is returned and
-        the collator handles windowing.
+        Maximum sequence length for header-preserving truncation in
+        prediction mode.  In pretrain mode the full sequence is returned
+        and the collator handles windowing.
     aces_label_path:
         Path to an ACES-format parquet/CSV with columns:
         subject_id, prediction_time, label.
         Required when task == "prediction".
     normalizer:
-        Optional ValueNormalizer instance.  When provided, z_scores are
-        computed for each event; otherwise z_scores are all 0.0.
+        Optional ValueNormalizer.  When provided, z_scores are computed;
+        otherwise z_scores are all 0.0.
     time_unit:
         Unit for delta_time computation.  "hours" (recommended) or "seconds".
+    cache_dir:
+        Directory for the parquet+index cache.  On first run the combined
+        DataFrame and row index are written here.  On subsequent runs they
+        are loaded directly.  Set to None to disable caching.
     """
 
     def __init__(
@@ -83,6 +97,7 @@ class MEDSDataset(Dataset):
         aces_label_path: Optional[str] = None,
         normalizer: Optional[ValueNormalizer] = None,
         time_unit: str = "hours",
+        cache_dir: Optional[str] = None,
     ):
         if task not in ("pretrain", "prediction"):
             raise ValueError(f"task must be 'pretrain' or 'prediction', got '{task}'")
@@ -95,13 +110,17 @@ class MEDSDataset(Dataset):
         self.normalizer = normalizer
         self.time_unit = time_unit
 
-        df = load_split(data_dir, split)
-        self.sequences: Dict[int, List[Event]] = build_subject_sequences(df)
+        # Load the full split as a polars DataFrame + a tiny row index dict.
+        # No Python Event objects are created here — they are built lazily
+        # in __getitem__ for one subject at a time.
+        self._df, self._row_index = load_or_build_polars_cache(
+            data_dir, split, cache_dir=cache_dir
+        )
 
         if task == "pretrain":
             self.samples: List[Dict[str, Any]] = [
                 {"subject_id": sid, "prediction_time": None, "label": 0}
-                for sid in sorted(self.sequences.keys())
+                for sid in sorted(self._row_index.keys())
             ]
         else:
             self.samples = self._load_aces_samples(aces_label_path)  # type: ignore[arg-type]
@@ -123,7 +142,7 @@ class MEDSDataset(Dataset):
         skipped = 0
         for _, row in aces.iterrows():
             sid = int(row["subject_id"])
-            if sid not in self.sequences:
+            if sid not in self._row_index:
                 skipped += 1
                 continue
             samples.append({
@@ -140,6 +159,11 @@ class MEDSDataset(Dataset):
     # Sequence helpers
     # ------------------------------------------------------------------
 
+    def _get_events(self, subject_id: int) -> List[Event]:
+        """Lazily convert one subject's rows from polars to Event objects."""
+        start, end = self._row_index[subject_id]
+        return df_slice_to_events(self._df[start:end])
+
     def _apply_time_cutoff(
         self,
         events: List[Event],
@@ -153,13 +177,10 @@ class MEDSDataset(Dataset):
         Header-preserving truncation for prediction sequences longer than
         max_seq_len.
 
-        Algorithm:
-          1. Separate the leading header tokens (AGE, GENDER, RACE, BMI).
-          2. Identify the first clinical event that would be kept in the tail
-             window.
-          3. Update the AGE numeric_value by adding round(years_elapsed) so
-             the header stays clinically accurate.
-          4. Return header + most-recent (max_seq_len - len(header)) events.
+        1. Separate the leading header tokens (AGE, GENDER, RACE, BMI).
+        2. Identify the first clinical event in the tail window.
+        3. Update AGE by adding round(years_elapsed) to keep it accurate.
+        4. Return header + most-recent (max_seq_len - len(header)) events.
         """
         if len(events) <= self.max_seq_len:
             return events
@@ -168,24 +189,19 @@ class MEDSDataset(Dataset):
         n_header = len(header)
         tail_budget = self.max_seq_len - n_header
 
-        # The tail is the most recent events after the header
         clinical_events = events[n_header:]
         tail = clinical_events[-tail_budget:] if tail_budget > 0 else []
 
-        # Adjust AGE: add the time gap from original header to start of tail
-        updated_header = list(header)  # shallow copy
+        updated_header = list(header)
         if tail and n_header > 0:
             original_age = get_age_from_header(header)
-            header_time = header[0].time  # AGE event timestamp
-            tail_start_time = tail[0].time
+            header_time  = header[0].time
+            tail_start   = tail[0].time
 
             if original_age is not None:
-                delta_days = (tail_start_time - header_time).total_seconds() / 86400.0
-                delta_years = delta_days / 365.25
-                new_age = original_age + round(delta_years)
-
-                # Rebuild AGE event with updated numeric_value
-                age_event = header[0]
+                delta_days  = (tail_start - header_time).total_seconds() / 86400.0
+                new_age     = original_age + round(delta_days / 365.25)
+                age_event   = header[0]
                 updated_header[0] = Event(
                     time=age_event.time,
                     code=age_event.code,
@@ -197,10 +213,7 @@ class MEDSDataset(Dataset):
     def _compute_delta_times(self, events: List[Event]) -> List[float]:
         """
         Compute log(1 + delta_time) for each event.
-
-        - Header events (NaT time) → 0.0
-        - First clinical event with a real timestamp → 0.0 (no prior event)
-        - Subsequent events: delta = log(1 + hours_since_previous_event)
+        Header events (NaT) → 0.0, first real event → 0.0.
         """
         seconds_per_unit = 3600.0 if self.time_unit == "hours" else 1.0
         delta_times: List[float] = []
@@ -214,15 +227,13 @@ class MEDSDataset(Dataset):
                 delta_times.append(0.0)
             else:
                 diff_seconds = (e.time - prev_time).total_seconds()
-                diff_units = max(0.0, diff_seconds / seconds_per_unit)
+                diff_units   = max(0.0, diff_seconds / seconds_per_unit)
                 delta_times.append(math.log(1.0 + diff_units))
             prev_time = e.time
 
         return delta_times
 
-    def _compute_z_scores(
-        self, events: List[Event]
-    ) -> List[float]:
+    def _compute_z_scores(self, events: List[Event]) -> List[float]:
         """Compute z-scores using the normalizer; returns 0.0 if no normalizer."""
         if self.normalizer is None:
             return [0.0] * len(events)
@@ -235,11 +246,11 @@ class MEDSDataset(Dataset):
     def _encode_events(self, events: List[Event]) -> Dict[str, Any]:
         """Convert a list of Events into the dict returned by __getitem__."""
         return {
-            "codes": [self.vocab.encode(e.code) for e in events],
-            "raw_codes": [e.code for e in events],
-            "times": [e.time for e in events],
-            "values": [e.numeric_value for e in events],
-            "z_scores": self._compute_z_scores(events),
+            "codes":       [self.vocab.encode(e.code) for e in events],
+            "raw_codes":   [e.code for e in events],
+            "times":       [e.time for e in events],
+            "values":      [e.numeric_value for e in events],
+            "z_scores":    self._compute_z_scores(events),
             "delta_times": self._compute_delta_times(events),
         }
 
@@ -251,11 +262,12 @@ class MEDSDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        sample = self.samples[idx]
+        sample     = self.samples[idx]
         subject_id = sample["subject_id"]
-        label = sample["label"]
+        label      = sample["label"]
 
-        events = list(self.sequences[subject_id])
+        # Lazy: convert only this subject's ~200 rows to Events
+        events = self._get_events(subject_id)
 
         if self.task == "prediction":
             events = self._apply_time_cutoff(events, sample["prediction_time"])
@@ -264,6 +276,6 @@ class MEDSDataset(Dataset):
         encoded = self._encode_events(events)
         return {
             "subject_id": subject_id,
-            "label": label,
+            "label":      label,
             **encoded,
         }

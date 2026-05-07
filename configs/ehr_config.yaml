@@ -26,6 +26,12 @@ data:
   # Required when training.task == "prediction"; ignored for pretrain.
   aces_label_path: null
 
+  # Directory for pickle caches of parsed subject sequences.
+  # On first run, parquet files are read and the result is saved here.
+  # On every subsequent run the pickle is loaded directly (much faster).
+  # Set to null to disable caching.
+  cache_dir: "/home/ag619/EHR-JEPA-Data/cache"
+
 wandb:
   enabled: true
   project: "EHR-JEPA"
@@ -37,7 +43,7 @@ normalizer:
 
 model:
   # Transformer hidden dimension.  All embedding outputs have this size.
-  d_model: 256
+  d_model: 768
 
   # Embedding mode:
   #   "learned"    — trainable nn.Embedding table, top-5000 vocab + UNK.
@@ -66,7 +72,7 @@ model:
   #   use_value: true,  use_time: false  →  code + value      (MLP: d_model+3)
   #   use_value: false, use_time: true   →  code + time       (MLP: d_model+1)
   #   use_value: true,  use_time: true   →  code + value + time (MLP: d_model+4)
-  use_value: true
+  use_value: false
   use_time: false
 
 masking:
@@ -88,7 +94,7 @@ predictor:
   # Branch selection:
   #   true  — Perceiver-JEPA: cross-attention pooling to fixed latents, latent predictor
   #   false — Token I-JEPA:   MASK tokens concat with context, token predictor
-  use_perceiver: false
+  use_perceiver: true
   # Branch A only: skip target spans shorter than this many tokens
   min_span_for_perceiver: 15
 
@@ -105,9 +111,19 @@ training:
   task: "pretrain"
 
   # Transformer context window.  Also used for collator windowing / padding.
-  max_seq_len: 512
+  max_seq_len: 2048
 
   batch_size: 32
+
+  # DataLoader parallelism.
+  # num_workers > 0 runs __getitem__ in parallel worker processes so the GPU
+  # never idles waiting for the next batch.  Set to 0 to disable (useful for
+  # debugging).  4–8 is a good starting point for most clusters.
+  num_workers: 8
+
+  # Allocate batch tensors in page-locked (pinned) host memory for faster
+  # CPU→GPU DMA transfers.  Automatically disabled when running on CPU-only.
+  pin_memory: true
 
   # Unit for delta_time before log(1 + x) transform.
   # Only relevant when model.use_time: true.

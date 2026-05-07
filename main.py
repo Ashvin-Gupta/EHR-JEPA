@@ -242,16 +242,22 @@ def build_loaders(
     vocab: Vocab | None,
     normalizer: ValueNormalizer | None,
 ) -> tuple[DataLoader, DataLoader | None]:
-    tr       = cfg.get("training", {})
-    data_cfg = cfg["data"]
+    tr        = cfg.get("training", {})
+    data_cfg  = cfg["data"]
 
-    max_seq_len: int = tr.get("max_seq_len", 512)
-    batch_size: int  = tr.get("batch_size", 32)
-    time_unit: str   = tr.get("time_unit", "hours")
-    task: str        = tr.get("task", "pretrain")
+    max_seq_len: int        = tr.get("max_seq_len", 512)
+    batch_size: int         = tr.get("batch_size", 32)
+    time_unit: str          = tr.get("time_unit", "hours")
+    task: str               = tr.get("task", "pretrain")
+    cache_dir: str | None   = data_cfg.get("cache_dir", None)
+    num_workers: int        = tr.get("num_workers", 4)
+    pin_memory: bool        = bool(tr.get("pin_memory", True)) and torch.cuda.is_available()
 
     if vocab is None:
         raise RuntimeError("vocab is required to encode sequences.")
+
+    if cache_dir:
+        print(f"[data] Sequence cache dir: {cache_dir}")
 
     def _ds(split: str) -> MEDSDataset:
         return MEDSDataset(
@@ -263,17 +269,53 @@ def build_loaders(
             aces_label_path=data_cfg.get("aces_label_path"),
             normalizer=normalizer,
             time_unit=time_unit,
+            cache_dir=cache_dir,
         )
 
-    collator = MEDSCollator(pad_idx=vocab.unk_idx, max_len=max_seq_len, task=task)
+    # Build the span masker and hand it to the collator so masking runs inside
+    # the DataLoader worker processes (parallel to GPU computation).
+    # Only used for pretrain; prediction tasks don't need masking in the loader.
+    collator_masker: SpanMasker | None = None
+    if task == "pretrain":
+        mask_cfg = cfg.get("masking", {})
+        collator_masker = SpanMasker(
+            mask_ratio=mask_cfg.get("mask_ratio", 0.30),
+            default_num_spans=mask_cfg.get("default_num_spans", 4),
+            min_span_length=mask_cfg.get("min_span_length", 15),
+        )
+
+    collator = MEDSCollator(
+        pad_idx=vocab.unk_idx,
+        max_len=max_seq_len,
+        task=task,
+        masker=collator_masker,
+    )
+
+    print("[data] Loading train split …")
+    train_ds = _ds("train")
+    print("[data] Loading tuning split …")
+    val_ds   = _ds("tuning")
+
+    # num_workers > 0: worker processes call __getitem__ in parallel while the
+    # GPU is computing the previous batch, eliminating the CPU↔GPU idle gap.
+    # pin_memory: tensors are allocated in page-locked RAM for faster DMA transfer.
+    # persistent_workers: keep workers alive between epochs (avoids fork overhead).
+    # prefetch_factor: each worker pre-fetches this many batches ahead.
+    loader_kwargs = dict(
+        collate_fn=collator,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+    masking_loc = "worker (fast)" if collator_masker is not None else "main thread"
+    print(f"[data] num_workers={num_workers}  pin_memory={pin_memory}  masking={masking_loc}")
 
     train_loader = DataLoader(
-        _ds("train"), batch_size=batch_size, collate_fn=collator,
-        shuffle=True, num_workers=0,
+        train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs
     )
     val_loader = DataLoader(
-        _ds("tuning"), batch_size=batch_size, collate_fn=collator,
-        shuffle=False, num_workers=0,
+        val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs
     )
     return train_loader, val_loader
 
@@ -412,8 +454,8 @@ def main(config_path: str, no_wandb: bool = False) -> None:
     # 6. Data
     print("[data] Building DataLoaders …")
     train_loader, val_loader = build_loaders(cfg, vocab, normalizer)
-    print(f"[data] Train batches: {len(train_loader)}")
-    print(f"[data] Val   batches: {len(val_loader)}")
+    print(f"[data] Train: {len(train_loader.dataset):,} subjects  |  {len(train_loader)} batches")
+    print(f"[data] Val:   {len(val_loader.dataset):,} subjects  |  {len(val_loader)} batches")
     print()
 
     # 7. Optimiser — built here so wandb can watch it; trainer uses same settings
@@ -424,23 +466,36 @@ def main(config_path: str, no_wandb: bool = False) -> None:
     )
 
     # 8. W&B callbacks
-    def on_epoch_end(epoch: int, metrics: dict) -> None:
-        if run is not None:
-            # Use global_step as x-axis so epoch and batch charts share the
-            # same timeline in W&B.  Filter out global_step itself — it's
-            # only used for the step argument, not as a logged metric.
-            step = int(metrics.get("global_step", metrics["epoch"]))
-            payload = {
-                f"epoch/{k}": v
-                for k, v in metrics.items()
-                if k != "global_step"
-            }
-            run.log(payload, step=step)
+    # All metrics use global_step as x-axis so batch and epoch charts share
+    # the same timeline on the W&B dashboard.
+    #
+    # Panel layout the user can configure in W&B:
+    #   "Loss Components"         — train/loss_*, val/loss_total
+    #   "Representation Health"   — train/std_dev_embeddings, val/rank_me
+    #   "Optimization & Hardware" — train/learning_rate, train/grad_norm,
+    #                               train/samples_per_second
+    #   "Medical Context"         — train/mask_ratio, train/avg_seq_length,
+    #                               val/unique_codes_seen
 
     def on_batch_end(epoch: int, global_step: int, metrics: dict) -> None:
         if run is not None:
-            run.log({f"batch/{k}": v for k, v in metrics.items()},
+            run.log({f"train/{k}": v for k, v in metrics.items()},
                     step=global_step)
+
+    def on_epoch_end(epoch: int, metrics: dict) -> None:
+        if run is not None:
+            step = int(metrics.get("global_step", 0))
+            # Only val metrics are logged at epoch boundaries; all train
+            # metrics are already captured per-batch above.
+            val_keys = {"val_loss", "std_dev_embeddings", "rank_me"}
+            payload: dict = {}
+            for k, v in metrics.items():
+                if k not in val_keys:
+                    continue
+                key = k.replace("val_", "val/", 1) if k.startswith("val_") else f"val/{k}"
+                payload[key] = v
+            if payload:
+                run.log(payload, step=step)
 
     # 9. Train
     print("[train] Starting training loop …")

@@ -14,6 +14,10 @@ Algorithm:
 
 No stop_gradient is applied here — gradients flow back through Z_target
 to the target encoder.  This is the sole training signal for that encoder.
+
+Note: dimensional collapse (all embeddings becoming identical) is monitored
+separately via `train/std_dev_embeddings` logged by the trainer — it does NOT
+affect the training objective here.
 """
 
 from __future__ import annotations
