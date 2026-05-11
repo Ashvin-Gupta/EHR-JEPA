@@ -155,7 +155,7 @@ training:
                                 # set to 0 to disable
   early_stopping_metric: "val_loss"   # "val_loss" or "train_loss"
 
-  n_epochs: 10
+  n_epochs: 30
 
   # Directory where best.pt and last.pt checkpoints are written.
   # Set to "" or omit to disable checkpointing.
@@ -171,7 +171,7 @@ downstream:
   enabled: true
 
   # Number of epochs to train the linear probe each time it runs.
-  probe_epochs: 15
+  probe_epochs: 6
 
   # Learning rate for the probe's AdamW optimiser.
   probe_lr: 1.0e-3
@@ -188,3 +188,6 @@ downstream:
   # Reduces inline probe evaluation time on large splits.
   # Set to null to use all available files.
   probe_max_files: 5
+  # Run the inline probe every N epochs (epoch 1 always runs regardless).
+  # Set to 1 to probe every epoch; set to e.g. 2 to probe every other epoch.
+  probe_interval: 5

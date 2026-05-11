@@ -326,6 +326,7 @@ class BERTTrainer(nn.Module):
         probe_n_epochs:     int   = 15,
         probe_lr:           float = 1e-3,
         probe_dropout:      float = 0.1,
+        probe_interval:     int   = 1,   # run probe every N epochs; always runs on epoch 1
         # ---- DDP ----
         ddp_module: Optional[nn.Module] = None,
         is_main_process: bool = True,
@@ -457,9 +458,13 @@ class BERTTrainer(nn.Module):
                 if on_epoch_end is not None:
                     on_epoch_end(epoch, epoch_metrics)
 
-                # Inline probe
+                # Inline probe — epoch 1 always; then every probe_interval epochs
+                _run_probe = (
+                    probe_train_loader is not None
+                    and ((epoch + 1) == 1 or (epoch + 1) % max(1, probe_interval) == 0)
+                )
                 probe_metrics: Dict[str, float] = {}
-                if probe_train_loader is not None:
+                if _run_probe:
                     print(f"  [probe] Running inline linear probe for epoch {epoch+1} …")
                     _pt0 = _time.perf_counter()
                     probe_metrics = self._run_inline_probe(
@@ -496,7 +501,7 @@ class BERTTrainer(nn.Module):
                         best_ckpt_metric = ckpt_monitor
                         torch.save(ckpt_payload, os.path.join(ckpt_dir, "best.pt"))
                         print(f"  [ckpt] Saved best.pt  (monitor={ckpt_monitor:.4f})")
-                    probe_auroc = probe_metrics.get("val_auroc", None) if probe_train_loader else None
+                    probe_auroc = probe_metrics.get("val_auroc", None) if _run_probe else None
                     if probe_auroc is not None and probe_auroc > best_probe_auroc:
                         best_probe_auroc = probe_auroc
                         torch.save(ckpt_payload, os.path.join(ckpt_dir, "probe_best.pt"))

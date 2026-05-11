@@ -753,7 +753,18 @@ class JEPATrainer(nn.Module):
         criterion = _nn.BCEWithLogitsLoss()
         optimizer = torch.optim.AdamW(probe.parameters(), lr=lr, weight_decay=1e-2)
 
+        # Build distributed val loader once (reused every epoch for per-epoch val)
+        dist_val_loader = None
+        if probe_val_loader is not None:
+            val_sampler = _DS(probe_val_loader.dataset, num_replicas=world_size,
+                              rank=rank, shuffle=False, drop_last=False)
+            dist_val_loader = _rebuild_loader(probe_val_loader, val_sampler)
+
+        combined_out: Dict[str, float] = {}
+        final_train_m: Dict[str, float] = {}
+
         for epoch in range(n_epochs):
+            # ---- Training ----
             train_sampler.set_epoch(epoch)
             ddp_probe.train()
             epoch_loss, epoch_logits, epoch_labels = 0.0, [], []
@@ -780,77 +791,82 @@ class JEPATrainer(nn.Module):
                 epoch_logits.append(logits.detach().cpu())
                 epoch_labels.append(labels.cpu())
 
-            avg_loss  = epoch_loss / max(len(dist_train_loader), 1)
-            train_auc = _compute_all_metrics(
-                torch.cat(epoch_labels), torch.cat(epoch_logits)
-            ).get("auroc", 0.0)
+            avg_train_loss = epoch_loss / max(len(dist_train_loader), 1)
+            train_m = _compute_all_metrics(torch.cat(epoch_labels), torch.cat(epoch_logits))
+            # Store final-epoch train metrics for the return dict
+            final_train_m = {
+                "train_loss":      avg_train_loss,
+                **{f"train_{k}": v for k, v in train_m.items()},
+            }
+
+            # ---- Per-epoch val evaluation (all ranks forward, gather on rank 0) ----
+            ddp_probe.eval()
+            val_line = ""
+            if dist_val_loader is not None:
+                local_logits: List[torch.Tensor] = []
+                local_labels: List[torch.Tensor] = []
+
+                with torch.no_grad():
+                    for batch in dist_val_loader:
+                        codes       = batch["codes"].to(device, non_blocking=True)
+                        attn_mask   = batch["attention_mask"].to(device, non_blocking=True)
+                        labels      = batch["labels"].float().to(device, non_blocking=True)
+                        values      = batch["values"].to(device, non_blocking=True)      if "values"      in batch else None
+                        z_scores    = batch["z_scores"].to(device, non_blocking=True)    if "z_scores"    in batch else None
+                        delta_times = batch["delta_times"].to(device, non_blocking=True) if "delta_times" in batch else None
+                        value_mask  = batch["value_mask"].to(device, non_blocking=True)  if "value_mask"  in batch else None
+
+                        z      = encoder(codes, attn_mask, values, z_scores, delta_times, value_mask)
+                        logits = probe(z)   # unwrapped probe — no DDP overhead in eval
+                        local_logits.append(logits.cpu())
+                        local_labels.append(labels.cpu())
+
+                local_logits_t = torch.cat(local_logits)
+                local_labels_t = torch.cat(local_labels)
+
+                # Exchange sizes so every rank knows how many samples each other has
+                local_size = torch.tensor([local_logits_t.shape[0]], dtype=torch.long, device=device)
+                all_sizes  = [torch.zeros(1, dtype=torch.long, device=device)
+                              for _ in range(world_size)]
+                _dist.all_gather(all_sizes, local_size)
+                max_size = int(max(s.item() for s in all_sizes))
+
+                def _pad(t: torch.Tensor) -> torch.Tensor:
+                    buf = t.new_zeros(max_size).to(device)
+                    buf[:t.shape[0]] = t.to(device)
+                    return buf
+
+                gathered_logits = [torch.zeros(max_size, device=device) for _ in range(world_size)]
+                gathered_labels = [torch.zeros(max_size, device=device) for _ in range(world_size)]
+                _dist.all_gather(gathered_logits, _pad(local_logits_t))
+                _dist.all_gather(gathered_labels, _pad(local_labels_t))
+
+                if rank == 0:
+                    all_logits = torch.cat([gathered_logits[i][:int(all_sizes[i].item())]
+                                            for i in range(world_size)]).cpu()
+                    all_labels = torch.cat([gathered_labels[i][:int(all_sizes[i].item())]
+                                            for i in range(world_size)]).cpu()
+                    val_m    = _compute_all_metrics(all_labels, all_logits)
+                    val_loss = criterion(all_logits, all_labels).item()
+                    combined_out = {"val_loss": val_loss,
+                                    **{f"val_{k}": v for k, v in val_m.items()}}
+                    val_line = (f"  val_loss={val_loss:.4f}"
+                                f"  val_auroc={val_m['auroc']:.4f}"
+                                f"  val_aupr={val_m['aupr']:.4f}")
 
             if rank == 0:
                 print(f"  probe epoch {epoch+1}/{n_epochs}  "
-                      f"loss={avg_loss:.4f}  auroc={train_auc:.4f}")
+                      f"loss={avg_train_loss:.4f}  auroc={train_m['auroc']:.4f}"
+                      f"{val_line}")
 
-        # ---- Distributed evaluation -------------------------------------------
-        # All ranks evaluate their val shard; logits + labels are gathered on
-        # rank 0 for a whole-dataset AUROC/AUPR.
-        ddp_probe.eval()
-        combined_out: Dict[str, float] = {}
-
-        if probe_val_loader is not None:
-            val_sampler = _DS(probe_val_loader.dataset, num_replicas=world_size,
-                              rank=rank, shuffle=False, drop_last=False)
-            dist_val_loader = _rebuild_loader(probe_val_loader, val_sampler)
-
-            local_logits: List[torch.Tensor] = []
-            local_labels: List[torch.Tensor] = []
-
-            with torch.no_grad():
-                for batch in dist_val_loader:
-                    codes       = batch["codes"].to(device, non_blocking=True)
-                    attn_mask   = batch["attention_mask"].to(device, non_blocking=True)
-                    labels      = batch["labels"].float().to(device, non_blocking=True)
-                    values      = batch["values"].to(device, non_blocking=True)      if "values"      in batch else None
-                    z_scores    = batch["z_scores"].to(device, non_blocking=True)    if "z_scores"    in batch else None
-                    delta_times = batch["delta_times"].to(device, non_blocking=True) if "delta_times" in batch else None
-                    value_mask  = batch["value_mask"].to(device, non_blocking=True)  if "value_mask"  in batch else None
-
-                    z      = encoder(codes, attn_mask, values, z_scores, delta_times, value_mask)
-                    logits = probe(z)   # probe (unwrapped) — no DDP overhead in eval
-                    local_logits.append(logits.cpu())
-                    local_labels.append(labels.cpu())
-
-            local_logits_t = torch.cat(local_logits)  # (N_local,)
-            local_labels_t = torch.cat(local_labels)
-
-            # Gather variable-length tensors: first exchange sizes, then pad & gather
-            local_size = torch.tensor([local_logits_t.shape[0]], dtype=torch.long, device=device)
-            all_sizes  = [torch.zeros(1, dtype=torch.long, device=device)
-                          for _ in range(world_size)]
-            _dist.all_gather(all_sizes, local_size)
-            max_size = int(max(s.item() for s in all_sizes))
-
-            def _pad(t: torch.Tensor) -> torch.Tensor:
-                buf = t.new_zeros(max_size).to(device)
-                buf[:t.shape[0]] = t.to(device)
-                return buf
-
-            gathered_logits = [torch.zeros(max_size, device=device) for _ in range(world_size)]
-            gathered_labels = [torch.zeros(max_size, device=device) for _ in range(world_size)]
-            _dist.all_gather(gathered_logits, _pad(local_logits_t))
-            _dist.all_gather(gathered_labels, _pad(local_labels_t))
-
-            if rank == 0:
-                # Trim DistributedSampler padding and concatenate
-                all_logits = torch.cat([gathered_logits[i][:int(all_sizes[i].item())]
-                                        for i in range(world_size)]).cpu()
-                all_labels = torch.cat([gathered_labels[i][:int(all_sizes[i].item())]
-                                        for i in range(world_size)]).cpu()
-                val_m    = _compute_all_metrics(all_labels, all_logits)
-                val_loss = criterion(all_logits, all_labels).item()
-                combined_out = {f"val_{k}": v for k, v in val_m.items()}
-                combined_out["val_loss"] = val_loss
+            ddp_probe.train()  # restore train mode for next epoch
 
         del encoder, ddp_probe, probe
         gc.collect()
+        # Merge final-epoch train metrics into val metrics for the return dict.
+        # combined_out is populated on rank 0; final_train_m is local (rank 0's shard)
+        # but is fine for monitoring purposes.
+        combined_out.update(final_train_m)
         return combined_out  # populated on rank 0, empty dict on other ranks
 
     # ------------------------------------------------------------------
@@ -870,6 +886,7 @@ class JEPATrainer(nn.Module):
         probe_n_epochs:     int   = 15,
         probe_lr:           float = 1e-3,
         probe_dropout:      float = 0.1,
+        probe_interval:     int   = 1,   # run probe every N epochs; always runs on epoch 1
         # ---- DDP ----
         ddp_module: Optional[nn.Module] = None,
         is_main_process: bool = True,
@@ -1116,8 +1133,13 @@ class JEPATrainer(nn.Module):
                 _dist.barrier()
 
             # ---- Inline probe evaluation (all ranks when DDP is active) --------
+            # Run on epoch 1 unconditionally, then every probe_interval epochs.
+            _run_probe_this_epoch = (
+                probe_train_loader is not None
+                and ((epoch + 1) == 1 or (epoch + 1) % max(1, probe_interval) == 0)
+            )
             probe_metrics: Dict[str, float] = {}
-            if probe_train_loader is not None:
+            if _run_probe_this_epoch:
                 import time as _probe_t
                 if is_main_process:
                     print(f"  [probe] Running inline linear probe for epoch {epoch+1} …")
@@ -1165,7 +1187,7 @@ class JEPATrainer(nn.Module):
                     best_ckpt_metric = ckpt_monitor
                     torch.save(ckpt_payload, os.path.join(ckpt_dir, "best.pt"))
                     print(f"  [ckpt] Saved best.pt  (monitor={ckpt_monitor:.4f})")
-                probe_auroc = probe_metrics.get("val_auroc", None) if probe_train_loader else None
+                probe_auroc = probe_metrics.get("val_auroc", None) if _run_probe_this_epoch else None
                 if probe_auroc is not None and probe_auroc > best_probe_auroc:
                     best_probe_auroc = probe_auroc
                     torch.save(ckpt_payload, os.path.join(ckpt_dir, "probe_best.pt"))

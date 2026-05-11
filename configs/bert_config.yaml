@@ -84,3 +84,5 @@ downstream:
   probe_batch_size: 64
   # Limit val (tuning) loader to N files for fast inline evaluation.
   probe_max_files: 5
+  # Run the inline probe every N epochs (epoch 1 always runs regardless).
+  probe_interval: 2
