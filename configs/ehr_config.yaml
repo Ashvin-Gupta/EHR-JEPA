@@ -21,10 +21,11 @@ data:
   # Where the built vocabulary is saved / loaded from.
   vocab_path: "/home/ag619/EHR-JEPA-Data/vocab.json"
 
-  # ACES-format label file (parquet or csv) with columns:
-  #   subject_id, prediction_time, label
-  # Required when training.task == "prediction"; ignored for pretrain.
-  aces_label_path: null
+  # Base directory that contains one sub-folder per downstream task, each
+  # holding three parquet files:
+  # Change labels_task to switch between tasks without editing paths.
+  labels_base_dir: "/home/ag619/EHR-JEPA-Data/labels"
+  labels_task: "icu_mortality"   # e.g. icu_mortality | hospital_mortality
 
   # Directory for pickle caches of parsed subject sequences.
   # On first run, parquet files are read and the result is saved here.
@@ -72,8 +73,8 @@ model:
   #   use_value: true,  use_time: false  →  code + value      (MLP: d_model+3)
   #   use_value: false, use_time: true   →  code + time       (MLP: d_model+1)
   #   use_value: true,  use_time: true   →  code + value + time (MLP: d_model+4)
-  use_value: false
-  use_time: false
+  use_value: true
+  use_time: true
 
 masking:
   mask_ratio: 0.30
@@ -97,6 +98,10 @@ predictor:
   use_perceiver: true
   # Branch A only: skip target spans shorter than this many tokens
   min_span_for_perceiver: 15
+  # Add a Linear + BatchNorm1d projection head after the target perceiver and
+  # predictor outputs.  Breaks the LN unit-sphere constraint and gives the
+  # anti-collapse objective (CovReg) a free representation space.  Recommended.
+  use_proj_head: true
 
 latent_pooling:
   n_latents: 16
@@ -111,9 +116,9 @@ training:
   task: "pretrain"
 
   # Transformer context window.  Also used for collator windowing / padding.
-  max_seq_len: 2048
+  max_seq_len: 1024
 
-  batch_size: 32
+  batch_size: 128
 
   # DataLoader parallelism.
   # num_workers > 0 runs __getitem__ in parallel worker processes so the GPU
@@ -143,11 +148,43 @@ training:
   min_lr_ratio: 0.1          # lr decays to min_lr_ratio * lr at end of training
 
   # ---- Gradient clipping ----
-  grad_clip: 1.0             # max gradient norm; set to 0 to disable
+  grad_clip: 0               # 0 = disabled
 
   # ---- Early stopping ----
-  early_stopping_patience: 5   # epochs without improvement before stopping
+  early_stopping_patience: 0   # epochs without improvement before stopping
                                 # set to 0 to disable
   early_stopping_metric: "val_loss"   # "val_loss" or "train_loss"
 
   n_epochs: 10
+
+  # Directory where best.pt and last.pt checkpoints are written.
+  # Set to "" or omit to disable checkpointing.
+  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/Fri8thMay4/checkpoints"
+
+# ---------------------------------------------------------------------------
+# Inline downstream evaluation
+# Run a fresh linear probe serially at the end of every pretraining epoch.
+# Metrics are logged to W&B under downstream_task/{data.labels_task}/
+# ---------------------------------------------------------------------------
+downstream:
+  # Set to true to enable.  Requires data.labels_base_dir and data.labels_task.
+  enabled: true
+
+  # Number of epochs to train the linear probe each time it runs.
+  probe_epochs: 15
+
+  # Learning rate for the probe's AdamW optimiser.
+  probe_lr: 1.0e-3
+
+  # Dropout applied before the linear layer.
+  probe_dropout: 0.1
+
+  # Batch size for downstream data (can be larger than pretrain batch_size
+  # since no gradients flow through the frozen encoder).
+  probe_batch_size: 64
+
+  # Limit the number of source parquet files used for the probe *val* (tuning)
+  # DataLoader only.  The probe training loader always uses all files.
+  # Reduces inline probe evaluation time on large splits.
+  # Set to null to use all available files.
+  probe_max_files: 5

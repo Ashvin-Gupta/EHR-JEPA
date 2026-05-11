@@ -27,9 +27,36 @@ import sys
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import yaml
+import polars as pl
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+# ---------------------------------------------------------------------------
+# DDP helpers
+# ---------------------------------------------------------------------------
+
+def _init_ddp() -> tuple[int, int, int, bool]:
+    """
+    Initialise the NCCL process group when torchrun sets LOCAL_RANK.
+
+    Returns (rank, local_rank, world_size, is_ddp).
+    When running with a plain `python main.py` call (no torchrun), all values
+    are 0/1/False and no process group is created.
+    """
+    local_rank  = int(os.environ.get("LOCAL_RANK",  0))
+    rank        = int(os.environ.get("RANK",        0))
+    world_size  = int(os.environ.get("WORLD_SIZE",  1))
+    is_ddp      = world_size > 1
+
+    if is_ddp:
+        torch.cuda.set_device(local_rank)
+        dist.init_process_group(backend="nccl")
+
+    return rank, local_rank, world_size, is_ddp
 
 # ---------------------------------------------------------------------------
 # Resolve project root so imports work regardless of cwd
@@ -49,7 +76,7 @@ from models.latent_pooling import LatentCrossAttentionPool
 from models.predictor import Predictor, TemporalSpanPrompt
 from models.transformer_encoder import EHRTransformerEncoder, TransformerEncoderConfig
 from training.trainer import JEPATrainer, TrainerConfig
-
+from evaluation.downstream_dataset import DownstreamDataset
 
 # ---------------------------------------------------------------------------
 # Config helpers
@@ -145,7 +172,8 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
     emb_type:      str  = m["embedding_type"]
     n_heads:       int  = t.get("n_heads", 8)
     n_latents:     int  = lp.get("n_latents", 16)
-    use_perceiver: bool = bool(p.get("use_perceiver", True))
+    use_perceiver:  bool = bool(p.get("use_perceiver", True))
+    use_proj_head:  bool = bool(p.get("use_proj_head", True))
 
     vocab_size = vocab.vocab_size if vocab is not None else m.get("vocab_size", 5001)
     unk_idx    = vocab.unk_idx    if vocab is not None else vocab_size - 1
@@ -206,6 +234,7 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
     trainer_cfg = TrainerConfig(
         use_perceiver=use_perceiver,
         min_span_for_perceiver=p.get("min_span_for_perceiver", 15),
+        use_proj_head=use_proj_head,
         lambda_cov=lc.get("lambda_cov", 0.1),
         lr=tr.get("lr", 1e-4),
         weight_decay=tr.get("weight_decay", 1e-2),
@@ -215,6 +244,7 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
         min_lr_ratio=tr.get("min_lr_ratio", 0.1),
         early_stopping_patience=tr.get("early_stopping_patience", 5),
         early_stopping_metric=tr.get("early_stopping_metric", "val_loss"),
+        checkpoint_dir=tr.get("checkpoint_dir", ""),
         n_epochs=tr.get("n_epochs", 10),
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
@@ -241,6 +271,7 @@ def build_loaders(
     cfg: dict,
     vocab: Vocab | None,
     normalizer: ValueNormalizer | None,
+    train_sampler: DistributedSampler | None = None,
 ) -> tuple[DataLoader, DataLoader | None]:
     tr        = cfg.get("training", {})
     data_cfg  = cfg["data"]
@@ -311,13 +342,165 @@ def build_loaders(
     masking_loc = "worker (fast)" if collator_masker is not None else "main thread"
     print(f"[data] num_workers={num_workers}  pin_memory={pin_memory}  masking={masking_loc}")
 
-    train_loader = DataLoader(
-        train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs
-    )
+    # With DDP, shuffle is handled by DistributedSampler (which must not be
+    # combined with shuffle=True on the DataLoader itself).
+    if train_sampler is not None:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, sampler=train_sampler, **loader_kwargs
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds, batch_size=batch_size, shuffle=True, **loader_kwargs
+        )
     val_loader = DataLoader(
         val_ds, batch_size=batch_size, shuffle=False, **loader_kwargs
     )
     return train_loader, val_loader
+
+
+# ---------------------------------------------------------------------------
+# Downstream probe DataLoader factory
+# ---------------------------------------------------------------------------
+
+def _label_path(task_dir: str, split: str) -> str | None:
+    p = os.path.join(task_dir, f"{split}_labels.parquet")
+    return p if os.path.exists(p) else None
+
+def _load_labels(path: str) -> dict:
+    df = pl.read_parquet(path)
+    return {row["subject_id"]: (row["prediction_time"], int(row["label"]))
+            for row in df.iter_rows(named=True)}
+
+def _make_probe_loader(
+    data_cfg: dict,
+    vocab: Vocab | None,
+    normalizer: ValueNormalizer | None,
+    DownstreamDataset,
+    MEDSDataset,
+    MEDSCollator,
+    split: str,
+    labels: dict,
+    shuffle: bool,
+    max_seq_len: int,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    max_files: int | None = None,
+) -> DataLoader | None:
+    if not labels:
+        return None
+    split_dir = os.path.join(data_cfg["data_dir"], split)
+    if not os.path.isdir(split_dir):
+        return None
+    ds = MEDSDataset(
+        data_dir=data_cfg["data_dir"],
+        vocab=vocab,
+        split=split,
+        task="pretrain",
+        max_seq_len=max_seq_len,
+        normalizer=normalizer,
+        cache_dir=data_cfg.get("cache_dir"),
+        max_files=max_files,
+    )
+    downstream = DownstreamDataset(ds, labels)
+    if len(downstream) == 0:
+        return None
+    collator = MEDSCollator(
+        pad_idx=vocab.unk_idx if vocab else 0,
+        max_len=max_seq_len,
+        task="prediction",
+    )
+    return DataLoader(
+        downstream,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        collate_fn=collator,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        persistent_workers=num_workers > 0,
+        prefetch_factor=2 if num_workers > 0 else None,
+    )
+
+def build_probe_loaders(
+    cfg: dict,
+    vocab: Vocab | None,
+    normalizer: ValueNormalizer | None,
+) -> tuple[DataLoader | None, DataLoader | None, DataLoader | None]:
+    """
+    Build train/val/test DataLoaders for inline linear-probe evaluation.
+
+    Returns (None, None, None) if downstream evaluation is disabled in the
+    config or the required label files do not exist.
+
+    The test (held_out) loader is built but only used after training to
+    evaluate the best-AUROC checkpoint on the held-out set.
+    """
+    ds_cfg = cfg.get("downstream", {})
+    if not ds_cfg.get("enabled", False):
+        return None, None, None
+
+    data_cfg = cfg["data"]
+    tr       = cfg.get("training", {})
+
+    labels_base = data_cfg.get("labels_base_dir", "")
+    task_name   = data_cfg.get("labels_task", "")
+    if not labels_base or not task_name:
+        print("[probe] labels_base_dir or labels_task not set — skipping inline probe.")
+        return None, None, None
+
+    task_dir = os.path.join(labels_base, task_name)
+
+    train_lbl      = _label_path(task_dir, "train")
+    tuning_lbl     = _label_path(task_dir, "tuning")
+    held_out_lbl   = _label_path(task_dir, "held_out")
+
+    if train_lbl is None:
+        print(f"[probe] train_labels.parquet not found in '{task_dir}' — skipping inline probe.")
+        return None, None, None
+
+    train_labels     = _load_labels(train_lbl)
+    tuning_labels    = _load_labels(tuning_lbl)    if tuning_lbl    else {}
+    held_out_labels  = _load_labels(held_out_lbl)  if held_out_lbl  else {}
+    print(
+        f"[probe] Task '{task_name}'  "
+        f"train={len(train_labels)}  val={len(tuning_labels)}  "
+        f"test={len(held_out_labels)}"
+    )
+
+    max_seq_len  = tr.get("max_seq_len", 512)
+    batch_size   = ds_cfg.get("probe_batch_size", tr.get("batch_size", 64))
+    num_workers  = tr.get("num_workers", 4)
+    pin_memory   = bool(tr.get("pin_memory", True)) and torch.cuda.is_available()
+    # Limit source parquet files for the val (tuning) loader only — keeps
+    # inline probe evaluation fast while training always uses the full dataset.
+    val_max_files = ds_cfg.get("probe_max_files", None)
+
+    # Train loader always uses ALL files — no file limit.
+    probe_train = _make_probe_loader(
+        data_cfg, vocab, normalizer, DownstreamDataset, MEDSDataset, MEDSCollator,
+        "train", train_labels, True, max_seq_len, batch_size, num_workers, pin_memory,
+    )
+    probe_val = _make_probe_loader(
+        data_cfg, vocab, normalizer, DownstreamDataset, MEDSDataset, MEDSCollator,
+        "tuning", tuning_labels, False, max_seq_len, batch_size, num_workers, pin_memory,
+        max_files=val_max_files,
+    )
+    # Test loader uses ALL held_out data (no file limit — used once after training).
+    probe_test = _make_probe_loader(
+        data_cfg, vocab, normalizer, DownstreamDataset, MEDSDataset, MEDSCollator,
+        "held_out", held_out_labels, False, max_seq_len, batch_size, num_workers, pin_memory,
+    )
+
+    if probe_train is None:
+        print("[probe] No labelled training subjects found — skipping inline probe.")
+        return None, None, None
+
+    print(
+        f"[probe] Probe loaders ready  train={len(probe_train.dataset)}"
+        + (f"  val={len(probe_val.dataset)}"   if probe_val  else "")
+        + (f"  test={len(probe_test.dataset)}" if probe_test else "")
+    )
+    return probe_train, probe_val, probe_test
 
 
 # ---------------------------------------------------------------------------
@@ -403,30 +586,138 @@ def init_wandb(cfg: dict, config_path: str, disabled: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# Final test evaluation helper
+# ---------------------------------------------------------------------------
+
+def _run_final_probe_test(
+    cfg: dict,
+    trainer,
+    probe_train_loader,
+    probe_test_loader,
+    probe_task: str,
+    run,
+) -> None:
+    """
+    After pretraining is complete, load the probe_best.pt checkpoint
+    (encoder with the best inline probe val_auroc), train a fresh linear probe
+    on the full probe training data, then evaluate once on the held-out test set.
+
+    Results are printed and logged to W&B under
+    ``downstream_task/{probe_task}/test_*``.
+    """
+    if probe_train_loader is None or probe_test_loader is None:
+        return
+
+    ckpt_dir = cfg.get("training", {}).get("checkpoint_dir", "").strip()
+    if not ckpt_dir:
+        print("[probe-test] No checkpoint_dir configured — skipping final test evaluation.")
+        return
+
+    # Prefer the encoder that gave the best probe val AUROC; fall back to the
+    # best pretraining-loss checkpoint, then the last checkpoint.
+    for ckpt_name in ("probe_best.pt", "best.pt", "last.pt"):
+        ckpt_path = os.path.join(ckpt_dir, ckpt_name)
+        if os.path.exists(ckpt_path):
+            break
+    else:
+        print("[probe-test] No checkpoint found — skipping final test evaluation.")
+        return
+
+    print(f"\n[probe-test] Loading encoder from '{ckpt_name}' …")
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    trainer.load_state_dict(ckpt["model_state"])
+    print(f"[probe-test] Encoder loaded (epoch {ckpt.get('epoch', '?')})")
+
+    from evaluation.linear_probe import (
+        FrozenEHREncoder, LinearProbe, train_linear_probe, _eval_probe,
+    )
+    import torch.nn as nn
+
+    device = torch.device(trainer.config.device)
+    ds_cfg = cfg.get("downstream", {})
+
+    pooler  = trainer.context_pooler
+    encoder = FrozenEHREncoder(
+        embedding=trainer.embedding,
+        encoder=trainer.encoder,
+        pooler=pooler,
+    ).to(device)
+    probe   = LinearProbe(
+        encoder.output_dim,
+        dropout=ds_cfg.get("probe_dropout", 0.1),
+    ).to(device)
+
+    print("[probe-test] Training final probe on full training data …")
+    _, _ = train_linear_probe(
+        encoder=encoder,
+        probe=probe,
+        train_loader=probe_train_loader,
+        val_loader=None,
+        n_epochs=ds_cfg.get("probe_epochs", 15),
+        lr=ds_cfg.get("probe_lr", 1e-3),
+        device=str(device),
+        verbose=True,
+    )
+
+    print("[probe-test] Evaluating on held-out test set …")
+    criterion   = nn.BCEWithLogitsLoss()
+    test_loss, test_metrics = _eval_probe(encoder, probe, probe_test_loader, criterion, device)
+
+    print()
+    print("=" * 62)
+    print("  Held-out test set results")
+    print(f"  Checkpoint:  {ckpt_name}")
+    print(f"  loss:        {test_loss:.4f}")
+    for k, v in test_metrics.items():
+        print(f"  {k:<14} {v:.4f}")
+    print("=" * 62)
+
+    if run is not None:
+        step = None   # W&B summary — not tied to a training step
+        payload = {
+            f"downstream_task/{probe_task}/test_loss": test_loss,
+            **{f"downstream_task/{probe_task}/test_{k}": v
+               for k, v in test_metrics.items()},
+        }
+        run.log(payload)
+        for k, v in payload.items():
+            run.summary[k.replace("/", ".")] = v
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 def main(config_path: str, no_wandb: bool = False) -> None:
+    # 0a. DDP initialisation — must happen before any CUDA calls
+    rank, local_rank, world_size, is_ddp = _init_ddp()
+    is_main = (rank == 0)   # only rank 0 does I/O, logging, checkpointing
+
     cfg = load_config(config_path)
 
-    # 0. Seed
-    set_seed(cfg.get("seed", None))
+    # 0b. Seed — offset per rank so each process sees a different data order
+    base_seed = cfg.get("seed", None)
+    set_seed(None if base_seed is None else base_seed + rank)
 
-    # 1. Print full config
-    _print_config(cfg, config_path)
+    # 1. Print full config (rank 0 only)
+    if is_main:
+        _print_config(cfg, config_path)
 
     # 2. Vocab
     vocab: Vocab | None = None
     if _needs_vocab(cfg):
         vocab = _ensure_vocab(cfg)
     else:
-        print("[vocab] Skipped — text_based mode uses pre-computed embeddings.")
+        if is_main:
+            print("[vocab] Skipped — text_based mode uses pre-computed embeddings.")
         vocab_path = cfg["data"]["vocab_path"]
         if os.path.exists(vocab_path):
             vocab = Vocab.load(vocab_path)
-            print(f"[vocab] Loaded text_based vocab '{vocab_path}' ({len(vocab)} codes)")
+            if is_main:
+                print(f"[vocab] Loaded text_based vocab '{vocab_path}' ({len(vocab)} codes)")
         else:
-            print(f"[vocab] ERROR: '{vocab_path}' not found — run encode_text_embeddings.py first.")
+            if is_main:
+                print(f"[vocab] ERROR: '{vocab_path}' not found — run encode_text_embeddings.py first.")
             sys.exit(1)
 
     # 3. Normalizer
@@ -434,29 +725,84 @@ def main(config_path: str, no_wandb: bool = False) -> None:
     if _needs_normalizer(cfg):
         normalizer = _ensure_normalizer(cfg)
     else:
-        print("[normalizer] Skipped — use_value=False.")
-    print()
+        if is_main:
+            print("[normalizer] Skipped — use_value=False.")
+    if is_main:
+        print()
 
-    # 4. W&B
-    run = init_wandb(cfg, config_path, disabled=no_wandb)
+    # 4. W&B — rank 0 only
+    run = init_wandb(cfg, config_path, disabled=no_wandb) if is_main else None
 
     # 5. Model
-    print("[model] Building model …")
+    if is_main:
+        print("[model] Building model …")
     trainer    = build_model(cfg, vocab)
     device_str = trainer.config.device
     n_params   = sum(p.numel() for p in trainer.parameters() if p.requires_grad)
-    print(f"[model] Device:               {device_str}")
-    print(f"[model] Trainable parameters: {n_params:,}")
-    if run is not None:
-        run.summary["n_params"] = n_params
-    print()
+    if is_main:
+        print(f"[model] Device:               {device_str}")
+        if is_ddp:
+            print(f"[model] DDP world size:       {world_size}")
+        print(f"[model] Trainable parameters: {n_params:,}")
+        if run is not None:
+            run.summary["n_params"] = n_params
+        print()
+
+    # 5b. DDP wrapping
+    device = torch.device(trainer.config.device)
+    ddp_trainer: DDP | None = None
+    if is_ddp:
+        # SyncBatchNorm ensures projection-head BN statistics are computed
+        # across all GPUs rather than independently per rank.
+        trainer = torch.nn.SyncBatchNorm.convert_sync_batchnorm(trainer)
+        trainer.to(device)
+        # find_unused_parameters=True is required because JEPATrainer contains
+        # both Branch A (Perceiver) and Branch B (Token I-JEPA) parameters.
+        # Whichever branch is inactive has parameters that never receive
+        # gradients, which DDP would otherwise error on.
+        ddp_trainer = DDP(
+            trainer,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=True,
+        )
 
     # 6. Data
-    print("[data] Building DataLoaders …")
-    train_loader, val_loader = build_loaders(cfg, vocab, normalizer)
-    print(f"[data] Train: {len(train_loader.dataset):,} subjects  |  {len(train_loader)} batches")
-    print(f"[data] Val:   {len(val_loader.dataset):,} subjects  |  {len(val_loader)} batches")
-    print()
+    if is_main:
+        print("[data] Building DataLoaders …")
+    train_sampler: DistributedSampler | None = None
+    if is_ddp:
+        # Build datasets first so we can attach the sampler
+        from data.meds_dataset import MEDSDataset as _DS
+        _tr = cfg.get("training", {})
+        _dc = cfg["data"]
+        _train_ds = _DS(
+            data_dir=_dc["data_dir"], vocab=vocab, split="train",
+            task=_tr.get("task", "pretrain"),
+            max_seq_len=_tr.get("max_seq_len", 512),
+            normalizer=normalizer,
+            time_unit=_tr.get("time_unit", "hours"),
+            cache_dir=_dc.get("cache_dir"),
+        )
+        train_sampler = DistributedSampler(
+            _train_ds, num_replicas=world_size, rank=rank, shuffle=True
+        )
+    train_loader, val_loader = build_loaders(cfg, vocab, normalizer, train_sampler=train_sampler)
+    if is_main:
+        print(f"[data] Train: {len(train_loader.dataset):,} subjects  |  {len(train_loader)} batches")
+        print(f"[data] Val:   {len(val_loader.dataset):,} subjects  |  {len(val_loader)} batches")
+        print()
+
+    # 6b. Downstream probe loaders — rank 0 only (probe runs serially on one GPU)
+    probe_train_loader, probe_val_loader, probe_test_loader = (
+        build_probe_loaders(cfg, vocab, normalizer) if is_main
+        else (None, None, None)
+    )
+    probe_task = cfg["data"].get("labels_task", "downstream")
+    if is_main and probe_train_loader is not None:
+        print(f"[probe] Inline probe enabled — task: '{probe_task}'")
+    if is_main:
+        print()
 
     # 7. Optimiser — built here so wandb can watch it; trainer uses same settings
     optimizer = optim.AdamW(
@@ -483,45 +829,79 @@ def main(config_path: str, no_wandb: bool = False) -> None:
                     step=global_step)
 
     def on_epoch_end(epoch: int, metrics: dict) -> None:
-        if run is not None:
-            step = int(metrics.get("global_step", 0))
-            # Only val metrics are logged at epoch boundaries; all train
-            # metrics are already captured per-batch above.
-            val_keys = {"val_loss", "std_dev_embeddings", "rank_me"}
-            payload: dict = {}
-            for k, v in metrics.items():
-                if k not in val_keys:
-                    continue
+        if run is None:
+            return
+        step = int(metrics.get("global_step", 0))
+        payload: dict = {}
+
+        # Val metrics logged at epoch boundaries
+        val_keys = {"val_loss", "std_dev_embeddings", "rank_me"}
+        for k, v in metrics.items():
+            if k in val_keys:
                 key = k.replace("val_", "val/", 1) if k.startswith("val_") else f"val/{k}"
                 payload[key] = v
-            if payload:
-                run.log(payload, step=step)
+
+        # Inline probe metrics logged under downstream_task/{task}/
+        for k, v in metrics.items():
+            if k.startswith("probe_"):
+                metric_name = k[len("probe_"):]   # strip "probe_" prefix
+                payload[f"downstream_task/{probe_task}/{metric_name}"] = v
+
+        if payload:
+            run.log(payload, step=step)
 
     # 9. Train
-    print("[train] Starting training loop …")
+    if is_main:
+        print("[train] Starting training loop …")
+    ds_cfg = cfg.get("downstream", {})
     history = trainer.train_loop(
         train_loader=train_loader,
         val_loader=val_loader,
         optimizer=optimizer,
         on_epoch_end=on_epoch_end,
         on_batch_end=on_batch_end,
+        probe_train_loader=probe_train_loader,
+        probe_val_loader=probe_val_loader,
+        probe_n_epochs=ds_cfg.get("probe_epochs", 15),
+        probe_lr=ds_cfg.get("probe_lr", 1e-3),
+        probe_dropout=ds_cfg.get("probe_dropout", 0.1),
+        ddp_module=ddp_trainer,
+        is_main_process=is_main,
+        train_sampler=train_sampler,
     )
 
-    # 10. Summary
-    print()
-    print("=" * 62)
-    print("  Training complete.")
-    print(f"  Final train loss: {history['train_loss'][-1]:.4f}")
-    if history["val_loss"]:
-        print(f"  Final val loss:   {history['val_loss'][-1]:.4f}")
-    print("=" * 62)
-
-    if run is not None:
-        run.summary["final_train_loss"] = history["train_loss"][-1]
+    # 10. Summary (rank 0 only)
+    if is_main:
+        print()
+        print("=" * 62)
+        print("  Training complete.")
+        print(f"  Final train loss: {history['train_loss'][-1]:.4f}")
         if history["val_loss"]:
-            run.summary["final_val_loss"] = history["val_loss"][-1]
-        run.finish()
-        print(f"[wandb] Run finished: {run.url}")
+            print(f"  Final val loss:   {history['val_loss'][-1]:.4f}")
+        print("=" * 62)
+
+        if run is not None:
+            run.summary["final_train_loss"] = history["train_loss"][-1]
+            if history["val_loss"]:
+                run.summary["final_val_loss"] = history["val_loss"][-1]
+
+        # 11. Final test evaluation with the best-probe-AUROC encoder checkpoint
+        _run_final_probe_test(
+            cfg=cfg,
+            trainer=trainer,
+            probe_train_loader=probe_train_loader,
+            probe_test_loader=probe_test_loader,
+            probe_task=probe_task,
+            run=run,
+        )
+
+        if run is not None:
+            run.finish()
+            print(f"[wandb] Run finished: {run.url}")
+
+    # Clean up process group
+    if is_ddp:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":

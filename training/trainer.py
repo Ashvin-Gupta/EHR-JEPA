@@ -31,6 +31,7 @@ Stop-grad is applied inside jepa_prediction_loss (detach on target).
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -45,6 +46,7 @@ from masking.span_masking import SpanMasker
 from models.event_embedding import EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
 from models.predictor import Predictor, TemporalSpanPrompt
+from models.projection_head import ProjectionHead
 from models.transformer_encoder import EHRTransformerEncoder
 
 
@@ -55,6 +57,12 @@ class TrainerConfig:
 
     # Branch A: skip target spans shorter than this (too short to pool meaningfully)
     min_span_for_perceiver: int = 15
+
+    # Projection heads (Linear + BatchNorm1d) applied after target perceiver and
+    # predictor outputs.  Breaks the unit-sphere constraint from the final
+    # LayerNorm and gives the anti-collapse objective a free representation space.
+    # Recommended: True.  Set False to ablate.
+    use_proj_head: bool = True
 
     lambda_cov: float = 0.1
 
@@ -74,6 +82,12 @@ class TrainerConfig:
     # Early stopping — set patience to 0 to disable
     early_stopping_patience: int = 5
     early_stopping_metric: str = "val_loss"
+
+    # Checkpointing — set to "" to disable
+    # Best model (by val_loss, or train_loss if no val set) is saved to
+    # {checkpoint_dir}/best.pt.  End-of-training model saved to
+    # {checkpoint_dir}/last.pt.
+    checkpoint_dir: str = ""
 
     # General
     n_epochs: int = 10
@@ -138,6 +152,16 @@ class JEPATrainer(nn.Module):
         d_model = encoder.config.d_model
         self.mask_token = nn.Parameter(torch.zeros(d_model))
 
+        # Projection heads (Linear + BN1d) — applied after target perceiver and
+        # predictor outputs to break the unit-sphere constraint of the final LN.
+        # Registered as None when disabled so state_dict round-trips cleanly.
+        if config.use_proj_head:
+            self.target_proj: Optional[ProjectionHead] = ProjectionHead(d_model)
+            self.pred_proj:   Optional[ProjectionHead] = ProjectionHead(d_model)
+        else:
+            self.target_proj = None
+            self.pred_proj   = None
+
         # Side-channel populated during each forward() call.
         # The train loop reads these after calling self.forward() so monitoring
         # metrics from inside the forward (target std-dev, mask ratio) are
@@ -180,7 +204,7 @@ class JEPATrainer(nn.Module):
         B, L = codes.shape
         device = codes.device
 
-        # 1. Embeddings
+        # 1a. Embeddings
         x = self.embedding(
             codes,
             values=values,
@@ -188,6 +212,32 @@ class JEPATrainer(nn.Module):
             delta_times=delta_times,
             value_mask=value_mask.float() if value_mask is not None else None,
         )  # (B, L, d)
+
+        # 1b. Post-MLP embedding std-dev monitoring.
+        #
+        # Both metrics measure the std of the embedding vectors output by
+        # EventEmbedding (after the residual MLP + LayerNorm), computed over
+        # real (non-padding) token positions and all d_model dimensions.
+        #
+        # std_dev_values — non-zero only when use_value=True (MLP includes value/z_score).
+        #   Diagnoses value-MLP health: if it collapses to 0, the residual
+        #   connection keeps embeddings alive but MLP contributes nothing.
+        #
+        # std_dev_times  — non-zero only when use_time=True (MLP includes delta_time).
+        #   Same diagnostic for the time branch.
+        #
+        # Both are 0.0 when the respective feature flag is disabled, making
+        # it easy to see which mode is active in W&B.
+        real_mask = attention_mask.bool()
+        x_real = x[real_mask]   # (N_real, d_model)
+
+        _std_values: float = 0.0
+        if z_scores is not None and x_real.numel() > 0:
+            _std_values = x_real.detach().float().std().item()
+
+        _std_times: float = 0.0
+        if delta_times is not None and x_real.numel() > 0:
+            _std_times = x_real.detach().float().std().item()
 
         # 2. Span masking — use pre-computed results from the DataLoader worker
         #    when available; fall back to on-the-fly masking otherwise.
@@ -216,6 +266,7 @@ class JEPATrainer(nn.Module):
             zero = x.new_zeros(())
             self._batch_mon = {
                 "std_dev_embeddings": 0.0, "rank_me": 0.0,
+                "std_dev_values": _std_values, "std_dev_times": _std_times,
                 "_N_input": 0, "_N_target": 0, "_N_context": 0,
                 "avg_context_length": 0.0, "avg_target_span_length": 0.0,
             }
@@ -297,9 +348,14 @@ class JEPATrainer(nn.Module):
         self._batch_mon = {
             "std_dev_embeddings":     std_dev,
             "rank_me":                rank_me,
+            # Feature std-devs (0.0 when feature is disabled):
+            #   std_dev_values = std of z_scores (should be ~1 if normalizer healthy)
+            #   std_dev_times  = std of log(1+hours) (should be ~1)
+            "std_dev_values":         _std_values,
+            "std_dev_times":          _std_times,
             # Raw token counts (batch-level sums) for ratio computation in train loop:
-            #   target_ratio  = N_target / N_input   (~30%, matches mask_ratio config)
-            #   context_ratio = N_context / N_total  (fraction of original traj used as context)
+            #   target_ratio  = N_targets / N_context
+            #   context_ratio = N_context / N_total
             "_N_input":               N_model,    # min(N_total, N_model) real tokens
             "_N_target":              N_target,   # tokens masked (all spans combined)
             "_N_context":             N_context,  # unmasked tokens fed to context encoder
@@ -422,8 +478,8 @@ class JEPATrainer(nn.Module):
             if span_len < min_span:
                 continue
 
-            # Target perceiver
-            Z_tgt = self.target_pooler(span_tokens)  # (B, n_latents, d)
+            # Target perceiver → (B, n_latents, d)
+            Z_tgt = self.target_pooler(span_tokens)
 
             # Temporal prompt for this span
             coords = self._span_coords_for_span(all_span_times, s, device)  # (B, 2)
@@ -432,8 +488,15 @@ class JEPATrainer(nn.Module):
                 Z_ctx + prompt
             )  # (B, n_latents, d)
 
-            # Predictor
-            Z_hat = self.predictor.transformer(Z_prompted)  # (B, n_latents, d)
+            # Predictor → (B, n_latents, d)
+            Z_hat = self.predictor.transformer(Z_prompted)
+
+            # Projection heads (Linear + BN1d) break the LN unit-sphere constraint
+            # and give the anti-collapse objective a free representation space.
+            if self.target_proj is not None:
+                Z_tgt = self.target_proj(Z_tgt)
+            if self.pred_proj is not None:
+                Z_hat = self.pred_proj(Z_hat)
 
             pred_losses.append(jepa_prediction_loss(Z_hat, Z_tgt))
             cov_losses.append(self.cov_loss(Z_tgt))
@@ -595,6 +658,79 @@ class JEPATrainer(nn.Module):
 
         raise ValueError(f"Unknown scheduler '{cfg.scheduler}'")
 
+    # ------------------------------------------------------------------
+    # Inline linear-probe evaluation
+    # ------------------------------------------------------------------
+
+    def _run_inline_probe(
+        self,
+        probe_train_loader: DataLoader,
+        probe_val_loader: Optional[DataLoader],
+        n_epochs: int,
+        lr: float,
+        dropout: float,
+        device: torch.device,
+    ) -> Dict[str, float]:
+        """
+        Train a fresh LinearProbe on top of the current (frozen) encoder weights
+        and return the final validation metrics.
+
+        Called serially at the end of each pretraining epoch.  The probe and
+        any intermediate tensors are deleted before returning so GPU memory is
+        fully released back to the main training loop.
+        """
+        import gc
+        # Lazy import — avoids a hard dependency at module load time
+        from evaluation.linear_probe import (
+            FrozenEHREncoder, LinearProbe, train_linear_probe,
+        )
+
+        pooler = self.context_pooler   # None for Branch B → mean-pooling fallback
+
+        encoder = FrozenEHREncoder(
+            embedding=self.embedding,
+            encoder=self.encoder,
+            pooler=pooler,
+        ).to(device)
+
+        probe = LinearProbe(encoder.output_dim, dropout=dropout).to(device)
+
+        history, final_val = train_linear_probe(
+            encoder=encoder,
+            probe=probe,
+            train_loader=probe_train_loader,
+            val_loader=probe_val_loader,
+            n_epochs=n_epochs,
+            lr=lr,
+            device=str(device),
+            verbose=True,
+        )
+
+        # Collect final-epoch training metrics from history
+        train_metrics: Dict[str, float] = {}
+        for key in ("train_loss", "train_auroc", "train_aupr",
+                    "train_recall", "train_precision", "train_accuracy"):
+            vals = history.get(key, [])
+            if vals:
+                train_metrics[key] = vals[-1]
+
+        # Free GPU memory before resuming pretraining.
+        # del + gc.collect() returns the tensors to PyTorch's allocator so the
+        # training loop immediately reuses the memory.  empty_cache() is NOT
+        # called here — it would release PyTorch's entire memory pool back to
+        # the OS, causing permanent GPU memory loss for the rest of training.
+        del encoder, probe
+        gc.collect()
+
+        # Return both val metrics (prefixed "val_*") and train metrics
+        combined: Dict[str, float] = {f"val_{k}": v for k, v in final_val.items()}
+        combined.update(train_metrics)   # already prefixed "train_*"
+        return combined
+
+    # ------------------------------------------------------------------
+    # Main training loop
+    # ------------------------------------------------------------------
+
     def train_loop(
         self,
         train_loader: DataLoader,
@@ -602,25 +738,45 @@ class JEPATrainer(nn.Module):
         optimizer: Optional[optim.Optimizer] = None,
         on_epoch_end: Optional[Callable[[int, Dict[str, float]], None]] = None,
         on_batch_end: Optional[Callable[[int, int, Dict[str, float]], None]] = None,
+        # ---- Inline probe evaluation ----
+        probe_train_loader: Optional[DataLoader] = None,
+        probe_val_loader:   Optional[DataLoader] = None,
+        probe_n_epochs:     int   = 15,
+        probe_lr:           float = 1e-3,
+        probe_dropout:      float = 0.1,
+        # ---- DDP ----
+        ddp_module: Optional[nn.Module] = None,
+        is_main_process: bool = True,
+        train_sampler = None,
     ) -> Dict[str, List[float]]:
         """
         Training loop with LR scheduling, gradient clipping, and early stopping.
 
         Parameters
         ----------
-        train_loader:   DataLoader for training data.
-        val_loader:     Optional DataLoader for validation.
-        optimizer:      Defaults to AdamW(weight_decay=config.weight_decay).
-        on_epoch_end:   Callback(epoch, metrics_dict) — keys: epoch, global_step,
-                        train_loss, train_l_pred, train_l_cov, val_loss (opt), lr.
-        on_batch_end:   Callback(epoch, global_step, metrics_dict) — keys:
-                        batch_loss, batch_l_pred, batch_l_cov, lr, grad_norm.
+        train_loader:     DataLoader for training data.
+        val_loader:       Optional DataLoader for validation.
+        optimizer:        Defaults to AdamW(weight_decay=config.weight_decay).
+        on_epoch_end:     Callback(epoch, metrics_dict) — called on main process only.
+        on_batch_end:     Callback(epoch, global_step, metrics_dict) — main process only.
+        ddp_module:       When running under DDP, pass the DDP-wrapped version of self.
+                          The forward pass is routed through it so gradients are
+                          all-reduced across processes.  When None, self.forward() is
+                          used directly (single-GPU / DataParallel).
+        is_main_process:  True for rank-0 only.  Controls printing, checkpointing,
+                          and W&B callbacks.
+        train_sampler:    DistributedSampler (or None).  When provided, its set_epoch()
+                          is called at the start of each epoch to reshuffle per-rank data.
 
         Returns
         -------
         History dict: train_loss, val_loss, lr (one per epoch), stopped_early.
         """
         cfg = self.config
+
+        # Route the forward pass through the DDP wrapper when available so
+        # NCCL all-reduces gradients across processes.  Fall back to self.
+        _forward = ddp_module if ddp_module is not None else self
 
         if optimizer is None:
             optimizer = optim.AdamW(
@@ -637,23 +793,37 @@ class JEPATrainer(nn.Module):
             "train_loss": [], "val_loss": [], "lr": []
         }
 
-        best_metric   = float("inf")
-        patience_left = cfg.early_stopping_patience
-        stopped_early = False
+        best_metric        = float("inf")
+        best_ckpt_metric   = float("inf")   # tracks best val/train loss for checkpointing
+        best_probe_auroc   = -float("inf")  # tracks best probe val_auroc for probe_best.pt
+        patience_left      = cfg.early_stopping_patience
+        stopped_early      = False
 
-        branch = "Perceiver (A)" if cfg.use_perceiver else "Token I-JEPA (B)"
-        print(f"[train] Branch:          {branch}")
-        print(f"[train] Scheduler:       {cfg.scheduler}")
-        print(f"[train] Grad clip:       {cfg.grad_clip if cfg.grad_clip > 0 else 'disabled'}")
-        print(f"[train] Weight decay:    {cfg.weight_decay}")
-        print(f"[train] lambda_cov:      {cfg.lambda_cov}")
-        print(f"[train] Early stopping:  "
-              f"{'disabled' if cfg.early_stopping_patience == 0 else f'patience={cfg.early_stopping_patience}, metric={cfg.early_stopping_metric}'}")
-        print()
+        # Set up checkpoint directory once so the path is always available
+        ckpt_dir = cfg.checkpoint_dir.strip() if cfg.checkpoint_dir else ""
+        if ckpt_dir and is_main_process:
+            os.makedirs(ckpt_dir, exist_ok=True)
+            print(f"[train] Checkpoints:     {ckpt_dir}")
+
+        if is_main_process:
+            branch = "Perceiver (A)" if cfg.use_perceiver else "Token I-JEPA (B)"
+            print(f"[train] Branch:          {branch}")
+            print(f"[train] Scheduler:       {cfg.scheduler}")
+            print(f"[train] Grad clip:       {cfg.grad_clip if cfg.grad_clip > 0 else 'disabled'}")
+            print(f"[train] Weight decay:    {cfg.weight_decay}")
+            print(f"[train] lambda_cov:      {cfg.lambda_cov}")
+            print(f"[train] Early stopping:  "
+                  f"{'disabled' if cfg.early_stopping_patience == 0 else f'patience={cfg.early_stopping_patience}, metric={cfg.early_stopping_metric}'}")
+            print()
 
         global_step = 0
         for epoch in range(cfg.n_epochs):
+            # Reshuffle each rank's data slice independently each epoch
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
             self.train()
+            if ddp_module is not None:
+                ddp_module.train()
             epoch_loss   = 0.0
             epoch_l_pred = 0.0
             epoch_l_cov  = 0.0
@@ -664,17 +834,17 @@ class JEPATrainer(nn.Module):
             for batch in train_loader:
                 t0 = _time.perf_counter()
 
-                codes       = batch["codes"].to(device)
-                attn_mask   = batch["attention_mask"].to(device)
+                codes       = batch["codes"].to(device, non_blocking=True)
+                attn_mask   = batch["attention_mask"].to(device, non_blocking=True)
                 values      = batch.get("values")
                 z_scores    = batch.get("z_scores")
                 delta_times = batch.get("delta_times")
                 value_mask  = batch.get("value_mask")
 
-                if values      is not None: values      = values.to(device)
-                if z_scores    is not None: z_scores    = z_scores.to(device)
-                if delta_times is not None: delta_times = delta_times.to(device)
-                if value_mask  is not None: value_mask  = value_mask.to(device)
+                if values      is not None: values      = values.to(device, non_blocking=True)
+                if z_scores    is not None: z_scores    = z_scores.to(device, non_blocking=True)
+                if delta_times is not None: delta_times = delta_times.to(device, non_blocking=True)
+                if value_mask  is not None: value_mask  = value_mask.to(device, non_blocking=True)
 
                 # Pre-computed masking from the DataLoader worker (plain Python
                 # lists — they stay on CPU, never move to device).
@@ -690,7 +860,7 @@ class JEPATrainer(nn.Module):
                 orig_seq_lengths = batch.get("orig_seq_lengths")
 
                 optimizer.zero_grad()
-                l_pred, l_cov, l_total = self.forward(
+                l_pred, l_cov, l_total = _forward(
                     codes, attn_mask, values, z_scores, delta_times, value_mask,
                     pre_mask=pre_mask,
                 )
@@ -720,7 +890,7 @@ class JEPATrainer(nn.Module):
                 epoch_progress = epoch + n_batches / max(total_batches, 1)
                 global_step  += 1
 
-                if on_batch_end is not None:
+                if is_main_process and on_batch_end is not None:
                     batch_metrics = {
                         "epoch":       epoch_progress,
                         # --- Panel: Loss Components ---
@@ -734,6 +904,8 @@ class JEPATrainer(nn.Module):
                         # --- Panel: Representation Health ---
                         "std_dev_embeddings":  self._batch_mon.get("std_dev_embeddings", 0.0),
                         "rank_me":             self._batch_mon.get("rank_me", 0.0),
+                        "std_dev_values":      self._batch_mon.get("std_dev_values", 0.0),
+                        "std_dev_times":       self._batch_mon.get("std_dev_times", 0.0),
                         # --- Panel: Medical Context ---
                         # N_total: original trajectory length (pre-windowing)
                         # N_context / N_target: computed after masking
@@ -778,29 +950,86 @@ class JEPATrainer(nn.Module):
             }
 
             val_line = ""
-            if val_loader is not None:
-                print(f"  [val] Running validation … ", end="", flush=True)
-                avg_val, val_metrics = self._eval_epoch(val_loader, device)
+            # Validation, logging, probe and checkpointing all run on main
+            # process only.  Other ranks proceed to the next epoch.
+            if is_main_process:
+                if val_loader is not None:
+                    print(f"  [val] Running validation … ", end="", flush=True)
+                    avg_val, val_metrics = self._eval_epoch(val_loader, device)
+                    print(
+                        f"val_loss={avg_val:.4f}"
+                        f"  std_dev={val_metrics.get('std_dev_embeddings', 0.0):.4f}"
+                        f"  rank_me={val_metrics.get('rank_me', 0.0):.1f}"
+                    )
+                    history["val_loss"].append(avg_val)
+                    epoch_metrics["val_loss"] = avg_val
+                    epoch_metrics.update(val_metrics)
+                    val_line = f"  val={avg_val:.4f}"
+
                 print(
-                    f"val_loss={avg_val:.4f}"
-                    f"  std_dev={val_metrics.get('std_dev_embeddings', 0.0):.4f}"
-                    f"  rank_me={val_metrics.get('rank_me', 0.0):.1f}"
+                    f"Epoch {epoch+1}/{cfg.n_epochs}  "
+                    f"train={avg_train:.4f}  (pred={avg_l_pred:.4f}, cov={avg_l_cov:.4f})"
+                    f"{val_line}  lr={current_lr:.2e}"
                 )
-                history["val_loss"].append(avg_val)
-                epoch_metrics["val_loss"] = avg_val
-                epoch_metrics.update(val_metrics)
-                val_line = f"  val={avg_val:.4f}"
 
-            print(
-                f"Epoch {epoch+1}/{cfg.n_epochs}  "
-                f"train={avg_train:.4f}  (pred={avg_l_pred:.4f}, cov={avg_l_cov:.4f})"
-                f"{val_line}  lr={current_lr:.2e}"
-            )
+                if on_epoch_end is not None:
+                    on_epoch_end(epoch, epoch_metrics)
 
-            if on_epoch_end is not None:
-                on_epoch_end(epoch, epoch_metrics)
+                # ---- Inline probe evaluation ----
+                probe_metrics: Dict[str, float] = {}
+                if probe_train_loader is not None:
+                    import time as _probe_t
+                    print(f"  [probe] Running inline linear probe for epoch {epoch+1} …")
+                    _pt0 = _probe_t.perf_counter()
+                    probe_metrics = self._run_inline_probe(
+                        probe_train_loader=probe_train_loader,
+                        probe_val_loader=probe_val_loader,
+                        n_epochs=probe_n_epochs,
+                        lr=probe_lr,
+                        dropout=probe_dropout,
+                        device=device,
+                    )
+                    probe_runtime = _probe_t.perf_counter() - _pt0
+                    probe_metrics["runtime_s"] = probe_runtime
+                    print(
+                        f"  [probe] Done in {probe_runtime:.1f}s  "
+                        f"train_loss={probe_metrics.get('train_loss', 0):.4f}  "
+                        f"val_loss={probe_metrics.get('val_loss', 0):.4f}  "
+                        f"val_auroc={probe_metrics.get('val_auroc', 0):.4f}  "
+                        f"val_aupr={probe_metrics.get('val_aupr', 0):.4f}"
+                    )
+                    if on_epoch_end is not None:
+                        on_epoch_end(
+                            epoch,
+                            {"global_step": global_step,
+                             **{f"probe_{k}": v for k, v in probe_metrics.items()}},
+                        )
 
-            if cfg.early_stopping_patience > 0:
+                # ---- Checkpointing ----
+                if ckpt_dir:
+                    ckpt_monitor = epoch_metrics.get("val_loss", avg_train)
+                    ckpt_payload = {
+                        "epoch":        epoch + 1,
+                        "global_step":  global_step,
+                        "val_loss":     epoch_metrics.get("val_loss", None),
+                        "train_loss":   avg_train,
+                        "model_state":  self.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                    }
+                    torch.save(ckpt_payload, os.path.join(ckpt_dir, "last.pt"))
+                    if ckpt_monitor < best_ckpt_metric:
+                        best_ckpt_metric = ckpt_monitor
+                        torch.save(ckpt_payload, os.path.join(ckpt_dir, "best.pt"))
+                        print(f"  [ckpt] Saved best.pt  (monitor={ckpt_monitor:.4f})")
+                    probe_auroc = probe_metrics.get("val_auroc", None) if probe_train_loader else None
+                    if probe_auroc is not None and probe_auroc > best_probe_auroc:
+                        best_probe_auroc = probe_auroc
+                        torch.save(ckpt_payload, os.path.join(ckpt_dir, "probe_best.pt"))
+                        print(f"  [ckpt] Saved probe_best.pt  (val_auroc={probe_auroc:.4f})")
+
+            # Early stopping is evaluated on the main process (which holds
+            # val metrics).  Other ranks just continue their training loop.
+            if is_main_process and cfg.early_stopping_patience > 0:
                 monitor = epoch_metrics.get(cfg.early_stopping_metric)
                 if monitor is None:
                     pass
@@ -848,16 +1077,16 @@ class JEPATrainer(nn.Module):
         emb_collected = 0
 
         for batch in loader:
-            codes       = batch["codes"].to(device)
-            attn_mask   = batch["attention_mask"].to(device)
+            codes       = batch["codes"].to(device, non_blocking=True)
+            attn_mask   = batch["attention_mask"].to(device, non_blocking=True)
             values      = batch.get("values")
             z_scores    = batch.get("z_scores")
             delta_times = batch.get("delta_times")
             value_mask  = batch.get("value_mask")
-            if values      is not None: values      = values.to(device)
-            if z_scores    is not None: z_scores    = z_scores.to(device)
-            if delta_times is not None: delta_times = delta_times.to(device)
-            if value_mask  is not None: value_mask  = value_mask.to(device)
+            if values      is not None: values      = values.to(device, non_blocking=True)
+            if z_scores    is not None: z_scores    = z_scores.to(device, non_blocking=True)
+            if delta_times is not None: delta_times = delta_times.to(device, non_blocking=True)
+            if value_mask  is not None: value_mask  = value_mask.to(device, non_blocking=True)
             pre_mask = (
                 {
                     "mask_context_indices": batch["mask_context_indices"],

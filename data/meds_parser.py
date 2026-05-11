@@ -167,6 +167,7 @@ def load_or_build_polars_cache(
     data_dir: str,
     split: str,
     cache_dir: Optional[str] = None,
+    max_files: Optional[int] = None,
 ):
     """
     Return (polars_df, row_index) for a split, using a parquet+index cache.
@@ -179,10 +180,27 @@ def load_or_build_polars_cache(
     (parallel I/O), builds the row index, then tries to write the cache.
     Disk-quota errors during the cache write are caught and logged; the
     function still returns the in-memory result so training can continue.
+
+    Parameters
+    ----------
+    max_files:
+        If set, only the first N parquet files (alphabetically) are loaded.
+        Caching is disabled when max_files is set to avoid polluting the
+        full-split cache with a subset.
     """
     import polars as pl
 
     parquet_files = _sorted_parquet_files(data_dir, split)
+    if max_files is not None and max_files < len(parquet_files):
+        parquet_files = parquet_files[:max_files]
+        print(f"  [max_files] Using {len(parquet_files)} of {len(_sorted_parquet_files(data_dir, split))} available files for split '{split}'")
+        # Skip cache for subsets to avoid polluting the full-split cache.
+        print(f"  scanning {len(parquet_files)} parquet files (no cache for subsets) …")
+        df = _read_split_polars(parquet_files)
+        print(f"  {len(df):,} rows loaded")
+        row_index = build_subject_row_index(df)
+        print(f"  {len(row_index):,} subjects indexed")
+        return df, row_index
 
     # ---- Try cache ----
     if cache_dir is not None:

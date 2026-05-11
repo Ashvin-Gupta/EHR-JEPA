@@ -98,6 +98,7 @@ class MEDSDataset(Dataset):
         normalizer: Optional[ValueNormalizer] = None,
         time_unit: str = "hours",
         cache_dir: Optional[str] = None,
+        max_files: Optional[int] = None,
     ):
         if task not in ("pretrain", "prediction"):
             raise ValueError(f"task must be 'pretrain' or 'prediction', got '{task}'")
@@ -114,7 +115,7 @@ class MEDSDataset(Dataset):
         # No Python Event objects are created here — they are built lazily
         # in __getitem__ for one subject at a time.
         self._df, self._row_index = load_or_build_polars_cache(
-            data_dir, split, cache_dir=cache_dir
+            data_dir, split, cache_dir=cache_dir, max_files=max_files,
         )
 
         if task == "pretrain":
