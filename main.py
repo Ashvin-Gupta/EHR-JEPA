@@ -539,7 +539,7 @@ def _flatten_config(cfg: dict, prefix: str = "") -> dict:
     return out
 
 
-def init_wandb(cfg: dict, config_path: str, disabled: bool = False):
+def init_wandb(cfg: dict, config_path: str, disabled: bool = False, run_name: str | None = None):
     """
     Initialise a W&B run.  Returns the run object, or a no-op stub if
     wandb is disabled or not installed.
@@ -556,7 +556,7 @@ def init_wandb(cfg: dict, config_path: str, disabled: bool = False):
         print("[wandb] wandb not installed — skipping. Run: pip install wandb")
         return None
 
-    run_name = _make_run_name(cfg)
+    run_name = run_name or wb_cfg.get("run_name") or _make_run_name(cfg)
     project  = wb_cfg.get("project", "EHR-JEPA")
     entity   = wb_cfg.get("entity", None)
 
@@ -628,21 +628,27 @@ def _run_final_probe_test(
     trainer.load_state_dict(ckpt["model_state"])
     print(f"[probe-test] Encoder loaded (epoch {ckpt.get('epoch', '?')})")
 
-    from evaluation.linear_probe import (
-        FrozenEHREncoder, LinearProbe, train_linear_probe, _eval_probe,
-    )
+    from evaluation.linear_probe import LinearProbe, train_linear_probe, _eval_probe
     import torch.nn as nn
 
     device = torch.device(trainer.config.device)
     ds_cfg = cfg.get("downstream", {})
 
-    pooler  = trainer.context_pooler
-    encoder = FrozenEHREncoder(
-        embedding=trainer.embedding,
-        encoder=trainer.encoder,
-        pooler=pooler,
-    ).to(device)
-    probe   = LinearProbe(
+    # Build the frozen encoder — BERT and JEPA have different wrappers but
+    # both satisfy the same (codes, attention_mask, ...) → (B, output_dim) interface.
+    from training.bert_trainer import BERTTrainer as _BERTTrainer
+    if isinstance(trainer, _BERTTrainer):
+        from evaluation.frozen_bert_encoder import FrozenBERTEncoder
+        encoder = FrozenBERTEncoder(trainer.model).to(device)
+    else:
+        from evaluation.linear_probe import FrozenEHREncoder
+        encoder = FrozenEHREncoder(
+            embedding=trainer.embedding,
+            encoder=trainer.encoder,
+            pooler=trainer.context_pooler,
+        ).to(device)
+
+    probe = LinearProbe(
         encoder.output_dim,
         dropout=ds_cfg.get("probe_dropout", 0.1),
     ).to(device)
@@ -793,14 +799,20 @@ def main(config_path: str, no_wandb: bool = False) -> None:
         print(f"[data] Val:   {len(val_loader.dataset):,} subjects  |  {len(val_loader)} batches")
         print()
 
-    # 6b. Downstream probe loaders — rank 0 only (probe runs serially on one GPU)
-    probe_train_loader, probe_val_loader, probe_test_loader = (
-        build_probe_loaders(cfg, vocab, normalizer) if is_main
-        else (None, None, None)
+    # 6b. Downstream probe loaders.
+    # When DDP is active all ranks build the loaders so every GPU can
+    # participate in the distributed probe.  Only rank 0 prints the summary.
+    if not is_main:
+        import io as _io
+        _saved_stdout, sys.stdout = sys.stdout, _io.StringIO()
+    probe_train_loader, probe_val_loader, probe_test_loader = build_probe_loaders(
+        cfg, vocab, normalizer
     )
+    if not is_main:
+        sys.stdout = _saved_stdout
     probe_task = cfg["data"].get("labels_task", "downstream")
     if is_main and probe_train_loader is not None:
-        print(f"[probe] Inline probe enabled — task: '{probe_task}'")
+        print(f"[probe] Inline probe enabled — task: '{probe_task}' (distributed across {world_size} GPU{'s' if world_size > 1 else ''})")
     if is_main:
         print()
 
@@ -868,6 +880,8 @@ def main(config_path: str, no_wandb: bool = False) -> None:
         ddp_module=ddp_trainer,
         is_main_process=is_main,
         train_sampler=train_sampler,
+        rank=rank,
+        world_size=world_size,
     )
 
     # 10. Summary (rank 0 only)

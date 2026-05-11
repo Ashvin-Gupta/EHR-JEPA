@@ -670,22 +670,29 @@ class JEPATrainer(nn.Module):
         lr: float,
         dropout: float,
         device: torch.device,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> Dict[str, float]:
         """
         Train a fresh LinearProbe on top of the current (frozen) encoder weights
         and return the final validation metrics.
 
-        Called serially at the end of each pretraining epoch.  The probe and
-        any intermediate tensors are deleted before returning so GPU memory is
-        fully released back to the main training loop.
+        When world_size > 1 (DDP active) all ranks participate:
+          - Training data is sharded via DistributedSampler.
+          - LinearProbe gradients are all-reduced via DDP.
+          - After training, each rank evaluates its val shard; predictions are
+            gathered to rank 0 before AUROC/AUPR are computed.
+          - Only rank 0 returns a populated metrics dict; other ranks return {}.
+
+        When world_size == 1 the existing single-GPU path (train_linear_probe)
+        is used unchanged.
         """
         import gc
-        # Lazy import — avoids a hard dependency at module load time
-        from evaluation.linear_probe import (
-            FrozenEHREncoder, LinearProbe, train_linear_probe,
-        )
+        import torch.nn as _nn
+        from evaluation.linear_probe import FrozenEHREncoder, LinearProbe
 
-        pooler = self.context_pooler   # None for Branch B → mean-pooling fallback
+        is_dist = (world_size > 1)
+        pooler  = self.context_pooler
 
         encoder = FrozenEHREncoder(
             embedding=self.embedding,
@@ -695,37 +702,156 @@ class JEPATrainer(nn.Module):
 
         probe = LinearProbe(encoder.output_dim, dropout=dropout).to(device)
 
-        history, final_val = train_linear_probe(
-            encoder=encoder,
-            probe=probe,
-            train_loader=probe_train_loader,
-            val_loader=probe_val_loader,
-            n_epochs=n_epochs,
-            lr=lr,
-            device=str(device),
-            verbose=True,
-        )
+        # ---- Single-GPU fast path ------------------------------------------------
+        if not is_dist:
+            from evaluation.linear_probe import train_linear_probe
+            history, final_val = train_linear_probe(
+                encoder=encoder, probe=probe,
+                train_loader=probe_train_loader, val_loader=probe_val_loader,
+                n_epochs=n_epochs, lr=lr, device=str(device), verbose=True,
+            )
+            train_metrics: Dict[str, float] = {}
+            for key in ("train_loss", "train_auroc", "train_aupr",
+                        "train_recall", "train_precision", "train_accuracy"):
+                vals = history.get(key, [])
+                if vals:
+                    train_metrics[key] = vals[-1]
+            del encoder, probe
+            gc.collect()
+            combined: Dict[str, float] = {f"val_{k}": v for k, v in final_val.items()}
+            combined.update(train_metrics)
+            return combined
 
-        # Collect final-epoch training metrics from history
-        train_metrics: Dict[str, float] = {}
-        for key in ("train_loss", "train_auroc", "train_aupr",
-                    "train_recall", "train_precision", "train_accuracy"):
-            vals = history.get(key, [])
-            if vals:
-                train_metrics[key] = vals[-1]
+        # ---- Distributed path ---------------------------------------------------
+        import torch.distributed as _dist
+        from torch.nn.parallel import DistributedDataParallel as _DDP
+        from torch.utils.data import DataLoader as _DL, DistributedSampler as _DS
+        from evaluation.linear_probe import _compute_all_metrics
 
-        # Free GPU memory before resuming pretraining.
-        # del + gc.collect() returns the tensors to PyTorch's allocator so the
-        # training loop immediately reuses the memory.  empty_cache() is NOT
-        # called here — it would release PyTorch's entire memory pool back to
-        # the OS, causing permanent GPU memory loss for the rest of training.
-        del encoder, probe
+        def _rebuild_loader(loader: DataLoader, sampler) -> DataLoader:
+            """Recreate a DataLoader with the given sampler (preserves all other kwargs)."""
+            return _DL(
+                loader.dataset,
+                batch_size=loader.batch_size,
+                sampler=sampler,
+                collate_fn=loader.collate_fn,
+                num_workers=loader.num_workers,
+                pin_memory=loader.pin_memory,
+                persistent_workers=loader.num_workers > 0,
+                prefetch_factor=2 if loader.num_workers > 0 else None,
+            )
+
+        train_sampler = _DS(probe_train_loader.dataset, num_replicas=world_size,
+                            rank=rank, shuffle=True, drop_last=True)
+        dist_train_loader = _rebuild_loader(probe_train_loader, train_sampler)
+
+        # Wrap linear probe with DDP for gradient synchronisation.
+        # The encoder is frozen — it runs independently on each rank with no
+        # need for all-reduce.
+        ddp_probe = _DDP(probe, device_ids=[device.index], output_device=device.index)
+
+        criterion = _nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.AdamW(probe.parameters(), lr=lr, weight_decay=1e-2)
+
+        for epoch in range(n_epochs):
+            train_sampler.set_epoch(epoch)
+            ddp_probe.train()
+            epoch_loss, epoch_logits, epoch_labels = 0.0, [], []
+
+            for batch in dist_train_loader:
+                codes       = batch["codes"].to(device, non_blocking=True)
+                attn_mask   = batch["attention_mask"].to(device, non_blocking=True)
+                labels      = batch["labels"].float().to(device, non_blocking=True)
+                values      = batch["values"].to(device, non_blocking=True)      if "values"      in batch else None
+                z_scores    = batch["z_scores"].to(device, non_blocking=True)    if "z_scores"    in batch else None
+                delta_times = batch["delta_times"].to(device, non_blocking=True) if "delta_times" in batch else None
+                value_mask  = batch["value_mask"].to(device, non_blocking=True)  if "value_mask"  in batch else None
+
+                with torch.no_grad():
+                    z = encoder(codes, attn_mask, values, z_scores, delta_times, value_mask)
+                logits = ddp_probe(z)
+                loss   = criterion(logits, labels)
+
+                optimizer.zero_grad()
+                loss.backward()   # DDP all-reduces gradients automatically
+                optimizer.step()
+
+                epoch_loss += loss.item()
+                epoch_logits.append(logits.detach().cpu())
+                epoch_labels.append(labels.cpu())
+
+            avg_loss  = epoch_loss / max(len(dist_train_loader), 1)
+            train_auc = _compute_all_metrics(
+                torch.cat(epoch_labels), torch.cat(epoch_logits)
+            ).get("auroc", 0.0)
+
+            if rank == 0:
+                print(f"  probe epoch {epoch+1}/{n_epochs}  "
+                      f"loss={avg_loss:.4f}  auroc={train_auc:.4f}")
+
+        # ---- Distributed evaluation -------------------------------------------
+        # All ranks evaluate their val shard; logits + labels are gathered on
+        # rank 0 for a whole-dataset AUROC/AUPR.
+        ddp_probe.eval()
+        combined_out: Dict[str, float] = {}
+
+        if probe_val_loader is not None:
+            val_sampler = _DS(probe_val_loader.dataset, num_replicas=world_size,
+                              rank=rank, shuffle=False, drop_last=False)
+            dist_val_loader = _rebuild_loader(probe_val_loader, val_sampler)
+
+            local_logits: List[torch.Tensor] = []
+            local_labels: List[torch.Tensor] = []
+
+            with torch.no_grad():
+                for batch in dist_val_loader:
+                    codes       = batch["codes"].to(device, non_blocking=True)
+                    attn_mask   = batch["attention_mask"].to(device, non_blocking=True)
+                    labels      = batch["labels"].float().to(device, non_blocking=True)
+                    values      = batch["values"].to(device, non_blocking=True)      if "values"      in batch else None
+                    z_scores    = batch["z_scores"].to(device, non_blocking=True)    if "z_scores"    in batch else None
+                    delta_times = batch["delta_times"].to(device, non_blocking=True) if "delta_times" in batch else None
+                    value_mask  = batch["value_mask"].to(device, non_blocking=True)  if "value_mask"  in batch else None
+
+                    z      = encoder(codes, attn_mask, values, z_scores, delta_times, value_mask)
+                    logits = probe(z)   # probe (unwrapped) — no DDP overhead in eval
+                    local_logits.append(logits.cpu())
+                    local_labels.append(labels.cpu())
+
+            local_logits_t = torch.cat(local_logits)  # (N_local,)
+            local_labels_t = torch.cat(local_labels)
+
+            # Gather variable-length tensors: first exchange sizes, then pad & gather
+            local_size = torch.tensor([local_logits_t.shape[0]], dtype=torch.long, device=device)
+            all_sizes  = [torch.zeros(1, dtype=torch.long, device=device)
+                          for _ in range(world_size)]
+            _dist.all_gather(all_sizes, local_size)
+            max_size = int(max(s.item() for s in all_sizes))
+
+            def _pad(t: torch.Tensor) -> torch.Tensor:
+                buf = t.new_zeros(max_size).to(device)
+                buf[:t.shape[0]] = t.to(device)
+                return buf
+
+            gathered_logits = [torch.zeros(max_size, device=device) for _ in range(world_size)]
+            gathered_labels = [torch.zeros(max_size, device=device) for _ in range(world_size)]
+            _dist.all_gather(gathered_logits, _pad(local_logits_t))
+            _dist.all_gather(gathered_labels, _pad(local_labels_t))
+
+            if rank == 0:
+                # Trim DistributedSampler padding and concatenate
+                all_logits = torch.cat([gathered_logits[i][:int(all_sizes[i].item())]
+                                        for i in range(world_size)]).cpu()
+                all_labels = torch.cat([gathered_labels[i][:int(all_sizes[i].item())]
+                                        for i in range(world_size)]).cpu()
+                val_m    = _compute_all_metrics(all_labels, all_logits)
+                val_loss = criterion(all_logits, all_labels).item()
+                combined_out = {f"val_{k}": v for k, v in val_m.items()}
+                combined_out["val_loss"] = val_loss
+
+        del encoder, ddp_probe, probe
         gc.collect()
-
-        # Return both val metrics (prefixed "val_*") and train metrics
-        combined: Dict[str, float] = {f"val_{k}": v for k, v in final_val.items()}
-        combined.update(train_metrics)   # already prefixed "train_*"
-        return combined
+        return combined_out  # populated on rank 0, empty dict on other ranks
 
     # ------------------------------------------------------------------
     # Main training loop
@@ -748,6 +874,8 @@ class JEPATrainer(nn.Module):
         ddp_module: Optional[nn.Module] = None,
         is_main_process: bool = True,
         train_sampler = None,
+        rank: int = 0,
+        world_size: int = 1,
     ) -> Dict[str, List[float]]:
         """
         Training loop with LR scheduling, gradient clipping, and early stopping.
@@ -949,9 +1077,14 @@ class JEPATrainer(nn.Module):
                 "global_step": global_step,
             }
 
+            # ---- Barrier 1: after training, before rank-0 validation -----------
+            # Ranks 1-3 must not start the next training epoch while rank 0 runs
+            # validation.  They wait here until rank 0 is done.
+            if ddp_module is not None:
+                import torch.distributed as _dist
+                _dist.barrier()
+
             val_line = ""
-            # Validation, logging, probe and checkpointing all run on main
-            # process only.  Other ranks proceed to the next epoch.
             if is_main_process:
                 if val_loader is not None:
                     print(f"  [val] Running validation … ", end="", flush=True)
@@ -975,20 +1108,31 @@ class JEPATrainer(nn.Module):
                 if on_epoch_end is not None:
                     on_epoch_end(epoch, epoch_metrics)
 
-                # ---- Inline probe evaluation ----
-                probe_metrics: Dict[str, float] = {}
-                if probe_train_loader is not None:
-                    import time as _probe_t
+            # ---- Barrier 2: before probe — all ranks participate ---------------
+            # Probe training is distributed: each rank processes its data shard
+            # and DDP all-reduces gradients on the linear layer.  All ranks must
+            # enter together.
+            if ddp_module is not None:
+                _dist.barrier()
+
+            # ---- Inline probe evaluation (all ranks when DDP is active) --------
+            probe_metrics: Dict[str, float] = {}
+            if probe_train_loader is not None:
+                import time as _probe_t
+                if is_main_process:
                     print(f"  [probe] Running inline linear probe for epoch {epoch+1} …")
-                    _pt0 = _probe_t.perf_counter()
-                    probe_metrics = self._run_inline_probe(
-                        probe_train_loader=probe_train_loader,
-                        probe_val_loader=probe_val_loader,
-                        n_epochs=probe_n_epochs,
-                        lr=probe_lr,
-                        dropout=probe_dropout,
-                        device=device,
-                    )
+                _pt0 = _probe_t.perf_counter()
+                probe_metrics = self._run_inline_probe(
+                    probe_train_loader=probe_train_loader,
+                    probe_val_loader=probe_val_loader,
+                    n_epochs=probe_n_epochs,
+                    lr=probe_lr,
+                    dropout=probe_dropout,
+                    device=device,
+                    rank=rank,
+                    world_size=world_size,
+                )
+                if is_main_process:
                     probe_runtime = _probe_t.perf_counter() - _pt0
                     probe_metrics["runtime_s"] = probe_runtime
                     print(
@@ -1005,27 +1149,33 @@ class JEPATrainer(nn.Module):
                              **{f"probe_{k}": v for k, v in probe_metrics.items()}},
                         )
 
-                # ---- Checkpointing ----
-                if ckpt_dir:
-                    ckpt_monitor = epoch_metrics.get("val_loss", avg_train)
-                    ckpt_payload = {
-                        "epoch":        epoch + 1,
-                        "global_step":  global_step,
-                        "val_loss":     epoch_metrics.get("val_loss", None),
-                        "train_loss":   avg_train,
-                        "model_state":  self.state_dict(),
-                        "optimizer_state": optimizer.state_dict(),
-                    }
-                    torch.save(ckpt_payload, os.path.join(ckpt_dir, "last.pt"))
-                    if ckpt_monitor < best_ckpt_metric:
-                        best_ckpt_metric = ckpt_monitor
-                        torch.save(ckpt_payload, os.path.join(ckpt_dir, "best.pt"))
-                        print(f"  [ckpt] Saved best.pt  (monitor={ckpt_monitor:.4f})")
-                    probe_auroc = probe_metrics.get("val_auroc", None) if probe_train_loader else None
-                    if probe_auroc is not None and probe_auroc > best_probe_auroc:
-                        best_probe_auroc = probe_auroc
-                        torch.save(ckpt_payload, os.path.join(ckpt_dir, "probe_best.pt"))
-                        print(f"  [ckpt] Saved probe_best.pt  (val_auroc={probe_auroc:.4f})")
+            # ---- Checkpointing (rank 0 only — uses gathered probe_metrics) -----
+            if is_main_process and ckpt_dir:
+                ckpt_monitor = epoch_metrics.get("val_loss", avg_train)
+                ckpt_payload = {
+                    "epoch":        epoch + 1,
+                    "global_step":  global_step,
+                    "val_loss":     epoch_metrics.get("val_loss", None),
+                    "train_loss":   avg_train,
+                    "model_state":  self.state_dict(),
+                    "optimizer_state": optimizer.state_dict(),
+                }
+                torch.save(ckpt_payload, os.path.join(ckpt_dir, "last.pt"))
+                if ckpt_monitor < best_ckpt_metric:
+                    best_ckpt_metric = ckpt_monitor
+                    torch.save(ckpt_payload, os.path.join(ckpt_dir, "best.pt"))
+                    print(f"  [ckpt] Saved best.pt  (monitor={ckpt_monitor:.4f})")
+                probe_auroc = probe_metrics.get("val_auroc", None) if probe_train_loader else None
+                if probe_auroc is not None and probe_auroc > best_probe_auroc:
+                    best_probe_auroc = probe_auroc
+                    torch.save(ckpt_payload, os.path.join(ckpt_dir, "probe_best.pt"))
+                    print(f"  [ckpt] Saved probe_best.pt  (val_auroc={probe_auroc:.4f})")
+
+            # ---- Barrier 3: before next epoch ----------------------------------
+            # Rank 0 may still be checkpointing (fast but non-zero).  Ensure all
+            # ranks start epoch N+1 together before DDP's next forward/all-reduce.
+            if ddp_module is not None:
+                _dist.barrier()
 
             # Early stopping is evaluated on the main process (which holds
             # val metrics).  Other ranks just continue their training loop.

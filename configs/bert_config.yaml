@@ -1,0 +1,86 @@
+# EHR-BERT configuration — BERT-style MLM pretraining baseline
+#
+# Deliberately mirrors ehr_config.yaml wherever possible so comparisons
+# between the JEPA and BERT baselines are fair.
+
+seed: 42
+
+data:
+  data_dir: "/home/ag619/clean_meds"
+  lookup_dir: "/home/ag619/MIMIC_data/hosp"
+  vocab_path: "/home/ag619/EHR-JEPA-Data/vocab.json"
+  labels_base_dir: "/home/ag619/EHR-JEPA-Data/labels"
+  labels_task: "icu_mortality"
+  cache_dir: "/home/ag619/EHR-JEPA-Data/cache"
+
+wandb:
+  enabled: true
+  project: "EHR-JEPA"
+  entity: null
+
+normalizer:
+  stats_path: "/home/ag619/EHR-JEPA-Data/normalizer_stats.json"
+
+model:
+  d_model: 768
+  embedding_type: "text_based"
+  text_encoder: "emilyalsentzer/Bio_ClinicalBERT"
+  code_embeddings_path: "/home/ag619/EHR-JEPA-Data/code_embeddings.pt"
+  encoder_hidden_dim: 768
+  vocab_size: 5000
+  use_value: true
+  use_time: true
+
+transformer:
+  n_layers: 6
+  n_heads: 8
+  ffn_dim: 256
+  dropout: 0.1
+
+mlm:
+  # Total fraction of real tokens selected for masking
+  mask_ratio: 0.15
+  # Of selected tokens: replaced with [MASK] token
+  mask_token_frac: 0.8333    # 12.5 / 15
+  # Of selected tokens: replaced with a random vocabulary token
+  random_frac: 0.1667        # 2.5 / 15
+  # Remainder (0%) are kept unchanged
+
+training:
+  task: "pretrain"
+  max_seq_len: 512
+  # Per-GPU batch size — kept small to avoid OOM at d_model=768 / seq_len=512.
+  # With 4 GPUs and gradient_accumulation_steps=6, effective batch ≈ 96*4=384.
+  batch_size: 64
+  gradient_accumulation_steps: 4
+  num_workers: 8
+  pin_memory: true
+  time_unit: "hours"
+
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+
+  scheduler: "cosine_warmup"
+  warmup_ratio: 0.05
+  min_lr_ratio: 0.1
+
+  grad_clip: 0
+
+  early_stopping_patience: 5
+  early_stopping_metric: "val_loss"
+
+  n_epochs: 10
+
+  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/bert_checkpoints"
+
+# ---------------------------------------------------------------------------
+# Inline downstream evaluation — same structure as ehr_config.yaml
+# ---------------------------------------------------------------------------
+downstream:
+  enabled: true
+  probe_epochs: 15
+  probe_lr: 1.0e-3
+  probe_dropout: 0.1
+  probe_batch_size: 64
+  # Limit val (tuning) loader to N files for fast inline evaluation.
+  probe_max_files: 5
