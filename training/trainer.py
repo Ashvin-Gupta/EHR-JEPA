@@ -40,7 +40,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
 
-from loss.covariance_reg import CovarianceRegularizationLoss
+from loss.covariance_reg import SIGRegLoss
 from loss.jepa_loss import jepa_prediction_loss
 from masking.span_masking import SpanMasker
 from models.event_embedding import EventEmbedding
@@ -116,7 +116,7 @@ class JEPATrainer(nn.Module):
     target_pooler:
         LatentCrossAttentionPool for target spans (Branch A only; None for B).
     cov_loss:
-        CovarianceRegularizationLoss — used by BOTH branches.
+        SIGRegLoss — anti-collapse regularizer on target embeddings (both branches).
     masker:
         SpanMasker.
     config:
@@ -132,7 +132,7 @@ class JEPATrainer(nn.Module):
         token_predictor: EHRTransformerEncoder,
         context_pooler: Optional[LatentCrossAttentionPool],
         target_pooler: Optional[LatentCrossAttentionPool],
-        cov_loss: CovarianceRegularizationLoss,
+        cov_loss: SIGRegLoss,
         masker: SpanMasker,
         config: TrainerConfig,
     ) -> None:
@@ -147,6 +147,9 @@ class JEPATrainer(nn.Module):
         self.cov_loss = cov_loss
         self.masker = masker
         self.config = config
+
+        # Training step for SIGReg RNG sync across DDP ranks (set each batch).
+        self._cov_global_step: int = 0
 
         # Learnable mask token for Branch B
         d_model = encoder.config.d_model
@@ -259,6 +262,19 @@ class JEPATrainer(nn.Module):
                 all_target_spans.append(result.target_spans)
                 all_span_times.append(result.span_times)
 
+        # --- Masking stats from the *full* collator mask (before batch truncation) ---
+        # We later slice every sample to min(num_spans) so Perceiver tensors align
+        # across the batch.  W&B ratios must still reflect the true mask budget
+        # (~mask_ratio * N_input), not the truncated span list.
+        B_size_pre = attention_mask.shape[0]
+        N_model_pre = int(attention_mask.sum().item())
+        per_sample_target_area_full = [
+            len({p for span in spans for p in span})
+            for spans in all_target_spans
+        ]
+        N_target_full = sum(per_sample_target_area_full)
+        N_context_full = N_model_pre - N_target_full
+
         # Use minimum num_spans across batch for uniform tensors
         num_spans_per_sample = [len(spans) for spans in all_target_spans]
         num_spans = min(num_spans_per_sample) if num_spans_per_sample else 0
@@ -324,26 +340,11 @@ class JEPATrainer(nn.Module):
                 std_dev = 0.0
                 rank_me = 0.0
 
-        # Raw token counts — ratios are computed in the train loop where
-        # orig_seq_lengths (N_total) is also available.
-        B_size       = attention_mask.shape[0]
-        N_model      = int(attention_mask.sum().item())   # real tokens after windowing
-        N_target     = sum(
-            sum(len(span) for span in spans)
-            for spans in all_target_spans
-        )
-        N_context    = N_model - N_target
-
-        # Average context length per sample
-        avg_ctx_len = sum(len(ctx) for ctx in all_context_indices) / max(B_size, 1)
-
-        # Average length of each individual target span
-        all_span_lengths = [
-            len(span)
-            for spans in all_target_spans
-            for span in spans
-        ]
-        avg_tgt_span_len = sum(all_span_lengths) / max(len(all_span_lengths), 1)
+        # Raw token counts — use full-mask totals (see N_target_full above).
+        # Ratios in train loop: target_ratio = N_target_full / N_input,
+        # context_ratio = N_context_full / sum(N_sequence) (per-batch).
+        avg_ctx_len = sum(len(ctx) for ctx in all_context_indices) / max(B_size_pre, 1)
+        avg_tgt_area = sum(per_sample_target_area_full) / max(B_size_pre, 1)
 
         self._batch_mon = {
             "std_dev_embeddings":     std_dev,
@@ -353,14 +354,13 @@ class JEPATrainer(nn.Module):
             #   std_dev_times  = std of log(1+hours) (should be ~1)
             "std_dev_values":         _std_values,
             "std_dev_times":          _std_times,
-            # Raw token counts (batch-level sums) for ratio computation in train loop:
-            #   target_ratio  = N_targets / N_context
-            #   context_ratio = N_context / N_total
-            "_N_input":               N_model,    # min(N_total, N_model) real tokens
-            "_N_target":              N_target,   # tokens masked (all spans combined)
-            "_N_context":             N_context,  # unmasked tokens fed to context encoder
+            # Batch sums: N_input = real tokens in window; N_target/N_context from
+            # full span mask (not truncated to min(num_spans) used in forward).
+            "_N_input":               N_model_pre,
+            "_N_target":              N_target_full,
+            "_N_context":             N_context_full,
             "avg_context_length":     avg_ctx_len,
-            "avg_target_span_length": avg_tgt_span_len,
+            "avg_target_span_length": avg_tgt_area,
             "_tgt_embs_for_rank": all_tgt.detach() if not self.training else None,
         }
 
@@ -499,7 +499,9 @@ class JEPATrainer(nn.Module):
                 Z_hat = self.pred_proj(Z_hat)
 
             pred_losses.append(jepa_prediction_loss(Z_hat, Z_tgt))
-            cov_losses.append(self.cov_loss(Z_tgt))
+            cov_losses.append(
+                self.cov_loss(Z_tgt, global_step=self._cov_global_step)
+            )
 
         if not pred_losses:
             zero = context_enc_out.new_zeros(())
@@ -574,7 +576,9 @@ class JEPATrainer(nn.Module):
             y_hat = out[:, N_ctx:, :]  # (B, N_span, d)
 
             pred_losses.append(jepa_prediction_loss(y_hat, y_tgt))
-            cov_losses.append(self.cov_loss(y_tgt))
+            cov_losses.append(
+                self.cov_loss(y_tgt, global_step=self._cov_global_step)
+            )
 
         if not pred_losses:
             zero = context_enc_out.new_zeros(())
@@ -1004,6 +1008,9 @@ class JEPATrainer(nn.Module):
 
                 orig_seq_lengths = batch.get("orig_seq_lengths")
 
+                # SIGReg: same projection directions on every GPU (seed = step index).
+                self._cov_global_step = global_step
+
                 optimizer.zero_grad()
                 l_pred, l_cov, l_total = _forward(
                     codes, attn_mask, values, z_scores, delta_times, value_mask,
@@ -1062,15 +1069,15 @@ class JEPATrainer(nn.Module):
                         "avg_context_length":    self._batch_mon.get("avg_context_length", 0.0),
                         "avg_target_span_length": self._batch_mon.get("avg_target_span_length", 0.0),
                         # Definitions (batch-level sums):
-                        #   N_representation = min(N_total, N_model) — fed to encoder
-                        #   N_targets  = mask_ratio × N_representation
-                        #   N_context  = N_representation − N_targets
+                        #   N_input    = real tokens after windowing/padding
+                        #   N_targets  = masked tokens
+                        #   N_context  = N_input - N_targets
                         #
-                        #   target_ratio  = N_targets / N_context
-                        #   context_ratio = N_context / N_total
+                        #   target_ratio  = N_targets / N_input
+                        #   context_ratio = N_context / N_full_sequence
                         "target_ratio": (
                             self._batch_mon.get("_N_target", 0)
-                            / max(self._batch_mon.get("_N_context", 1), 1)
+                            / max(self._batch_mon.get("_N_input", 1), 1)
                         ),
                         "context_ratio": (
                             self._batch_mon.get("_N_context", 0)

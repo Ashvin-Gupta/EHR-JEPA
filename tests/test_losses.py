@@ -1,5 +1,5 @@
 """
-Tests for loss/jepa_loss.py and loss/covariance_reg.py.
+Tests for loss/jepa_loss.py and loss/covariance_reg.py (SIGReg).
 """
 
 import os
@@ -10,10 +10,10 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from loss.jepa_loss import jepa_prediction_loss
-from loss.covariance_reg import CovarianceRegularizationLoss
+from loss.covariance_reg import SIGRegLoss
 
 
-B, NS, NL, D = 2, 4, 8, 32   # batch, spans, latents, d_model
+B, NS, NL, D = 2, 4, 8, 32
 
 
 def _shape():
@@ -40,10 +40,6 @@ def test_jepa_loss_positive():
 
 
 def test_jepa_loss_no_grad_through_target():
-    """
-    Stop-gradient: after backward, z_target should have no gradient.
-    (Only z_pred should receive gradient from L_pred.)
-    """
     z_pred = torch.randn(*_shape(), requires_grad=True)
     z_target = torch.randn(*_shape(), requires_grad=True)
 
@@ -66,72 +62,45 @@ def test_jepa_loss_scalar():
 
 
 # ------------------------------------------------------------------
-# Covariance Regularization Loss
+# SIGReg Loss
 # ------------------------------------------------------------------
 
-def test_cov_loss_shape():
-    cov_loss = CovarianceRegularizationLoss(d_model=D, proj_dim=16)
+def test_sigreg_loss_shape():
+    sig = SIGRegLoss(num_slices=16)
     z = torch.randn(*_shape())
-    loss = cov_loss(z)
+    loss = sig(z, global_step=1)
     assert loss.ndim == 0
-    print(f"\n[test_cov_loss_shape] loss shape={loss.shape}, value={loss.item():.4f}")
+    print(f"\n[test_sigreg_loss_shape] loss shape={loss.shape}, value={loss.item():.4f}")
 
 
-def test_cov_loss_identity():
-    """
-    Near-uncorrelated embeddings should produce low covariance loss.
-    We use many samples with random normal features.
-    """
-    cov_loss = CovarianceRegularizationLoss(d_model=D, proj_dim=16)
-    # Large batch, random → near-identity covariance after projection
-    z = torch.randn(64, NS, NL, D)
-    loss = cov_loss(z)
-    print(f"\n[test_cov_loss_identity] loss with random Z: {loss.item():.4f}")
-    # Just check it's finite and non-negative (exact value depends on random projection weights)
-    assert loss.item() >= 0.0
-    assert not torch.isnan(loss)
+def test_sigreg_deterministic_given_global_step():
+    """Same global_step → same loss on same input (CPU Generator sync)."""
+    sig = SIGRegLoss(num_slices=16)
+    z = torch.randn(*_shape())
+    l1 = sig(z, global_step=12345)
+    l2 = sig(z, global_step=12345)
+    assert l1.item() == pytest.approx(l2.item(), rel=0.0, abs=1e-6)
 
 
-def test_cov_loss_collapsed():
-    """All-same embeddings → high covariance deviation from identity."""
-    cov_loss = CovarianceRegularizationLoss(d_model=D, proj_dim=16)
-    # All identical rows → after projection still identical → covariance is rank-1
-    z = torch.ones(*_shape())
-    loss_collapsed = cov_loss(z)
-
-    z_random = torch.randn(*_shape())
-    loss_random = cov_loss(z_random)
-
-    print(f"\n[test_cov_loss_collapsed]")
-    print(f"  collapsed (all same):  {loss_collapsed.item():.4f}")
-    print(f"  random:                {loss_random.item():.4f}")
-    # Collapsed should have higher covariance penalty (cov matrix is far from identity)
-    assert loss_collapsed.item() > 0.0
-
-
-def test_cov_loss_gradients_flow():
-    """
-    L_cov must produce gradients through Z_target — no stop_gradient here.
-    This is the sole training signal for the target encoder.
-    """
-    cov_loss = CovarianceRegularizationLoss(d_model=D, proj_dim=16)
+def test_sigreg_gradients_flow():
+    sig = SIGRegLoss(num_slices=16)
     z_target = torch.randn(*_shape(), requires_grad=True)
-    loss = cov_loss(z_target)
+    loss = sig(z_target, global_step=7)
     loss.backward()
 
-    assert z_target.grad is not None, "z_target should receive gradient from L_cov"
-    grad_norm = z_target.grad.norm().item()
-    print(f"\n[test_cov_loss_gradients_flow]")
-    print(f"  z_target grad norm: {grad_norm:.6f}  (should be > 0)")
-    assert grad_norm > 0.0
+    assert z_target.grad is not None
+    assert z_target.grad.norm().item() > 0.0
 
 
-def test_cov_loss_projection_trainable():
-    cov_loss = CovarianceRegularizationLoss(d_model=D, proj_dim=16)
-    for name, p in cov_loss.named_parameters():
-        assert p.requires_grad, f"Parameter {name} should be trainable"
-    print(f"\n[test_cov_loss_projection_trainable] "
-          f"proj weight shape: {tuple(cov_loss.proj.weight.shape)}")
+def test_sigreg_no_trainable_submodules():
+    sig = SIGRegLoss(num_slices=32)
+    assert list(sig.parameters()) == []
+
+
+def test_covariance_alias_import():
+    """Backward-compat alias still imports."""
+    from loss.covariance_reg import CovarianceRegularizationLoss
+    assert CovarianceRegularizationLoss is SIGRegLoss
 
 
 if __name__ == "__main__":
@@ -141,23 +110,23 @@ if __name__ == "__main__":
         test_jepa_loss_positive,
         test_jepa_loss_no_grad_through_target,
         test_jepa_loss_scalar,
-        test_cov_loss_shape,
-        test_cov_loss_identity,
-        test_cov_loss_collapsed,
-        test_cov_loss_gradients_flow,
-        test_cov_loss_projection_trainable,
+        test_sigreg_loss_shape,
+        test_sigreg_deterministic_given_global_step,
+        test_sigreg_gradients_flow,
+        test_sigreg_no_trainable_submodules,
+        test_covariance_alias_import,
     ]
     passed = failed = 0
     for fn in tests:
         try:
             fn()
             passed += 1
-        except Exception as e:
+        except Exception:
             print(f"\n  FAILED: {fn.__name__}")
             traceback.print_exc()
             failed += 1
     print(f"\n{'='*50}")
     print(f"RESULTS: {passed} passed, {failed} failed out of {len(tests)} tests")
-    print("="*50)
+    print("=" * 50)
     if failed:
         sys.exit(1)

@@ -10,7 +10,9 @@ For a sequence of N real (non-padding) tokens:
   last_span   = T_span + (B - T_span * num_spans)  ← receives remainder
 
 Span selection:
-  Sample non-overlapping, non-padding spans by rejection sampling.
+  - allow_overlap=False (default): sample non-overlapping spans.
+  - allow_overlap=True: sample spans independently; overlaps are allowed
+    (closer to i-JEPA style target block sampling).
   Each span is a contiguous range of positions from the set of real token
   positions.
 
@@ -51,6 +53,12 @@ class SpanMasker:
     min_span_length:
         Minimum events per span.  Used to dynamically reduce num_spans
         for short sequences.
+    min_gap_events:
+        Minimum number of events between consecutive spans when
+        allow_overlap=False.  Ignored when allow_overlap=True.
+    allow_overlap:
+        If True, target spans may overlap. If False, spans are forced to be
+        disjoint whenever the budget allows.
     seed:
         Optional random seed for reproducibility (testing only).
     """
@@ -60,11 +68,15 @@ class SpanMasker:
         mask_ratio: float = 0.30,
         default_num_spans: int = 4,
         min_span_length: int = 15,
+        min_gap_events: int = 0,
+        allow_overlap: bool = False,
         seed: Optional[int] = None,
     ) -> None:
         self.mask_ratio = mask_ratio
         self.default_num_spans = default_num_spans
         self.min_span_length = min_span_length
+        self.min_gap_events = max(0, int(min_gap_events))
+        self.allow_overlap = allow_overlap
         self._rng = random.Random(seed)
 
     def __call__(
@@ -101,13 +113,21 @@ class SpanMasker:
             real_positions = list(range(seq_len))
 
         N = len(real_positions)
-        B = int(N * self.mask_ratio)
+        # Clamp budget to [0, N] so impossible configurations (e.g. mask_ratio>1)
+        # never request more target tokens than available.
+        B = max(0, min(int(N * self.mask_ratio), N))
 
         # Dynamic num_spans
         if B >= self.default_num_spans * self.min_span_length:
             num_spans = self.default_num_spans
         else:
             num_spans = max(1, B // self.min_span_length)
+
+        # Enforce minimum inter-span gap for non-overlap mode:
+        # total_span_tokens + gap*(num_spans-1) must fit into N.
+        if not self.allow_overlap and self.min_gap_events > 0:
+            while num_spans > 1 and (B + self.min_gap_events * (num_spans - 1) > N):
+                num_spans -= 1
 
         if B == 0 or num_spans == 0:
             return SpanMaskResult(
@@ -127,7 +147,7 @@ class SpanMasker:
         span_lengths = [s for s in span_lengths if s > 0]
         num_spans = len(span_lengths)
 
-        # Sample non-overlapping spans (positions in real_positions space)
+        # Sample spans (overlap behavior controlled by allow_overlap)
         selected_spans: List[List[int]] = self._sample_spans(
             real_positions, span_lengths
         )
@@ -167,34 +187,67 @@ class SpanMasker:
         span_lengths: List[int],
     ) -> List[List[int]]:
         """
-        Sample len(span_lengths) non-overlapping contiguous spans from
+        Sample len(span_lengths) contiguous spans from
         real_positions (a contiguous range by index, not necessarily by
         original position values).
 
-        Uses rejection sampling with a maximum attempt budget.
+        If allow_overlap=True, spans are sampled independently and may overlap.
+        If allow_overlap=False, uses a gap-sampling construction ("stars and
+        bars") in index space so all spans are always placed when
+        sum(span_lengths) <= N.
         """
         N = len(real_positions)
-        selected: List[List[int]] = []
-        occupied: set = set()
+        if not span_lengths:
+            return []
 
-        for span_len in span_lengths:
-            max_start_idx = N - span_len
-            if max_start_idx < 0:
-                # Sequence too short; skip this span
-                continue
-
-            chosen = None
-            for _ in range(1000):
+        if self.allow_overlap:
+            selected: List[List[int]] = []
+            for span_len in span_lengths:
+                max_start_idx = N - span_len
+                if max_start_idx < 0:
+                    continue
                 start_idx = self._rng.randint(0, max_start_idx)
-                candidate_idx = list(range(start_idx, start_idx + span_len))
-                candidate_pos = [real_positions[i] for i in candidate_idx]
+                end_idx = start_idx + span_len
+                selected.append([real_positions[j] for j in range(start_idx, end_idx)])
+            return selected
 
-                if not occupied.intersection(candidate_pos):
-                    chosen = candidate_pos
-                    break
+        total_len = sum(span_lengths)
+        k = len(span_lengths)
+        mandatory_gap = self.min_gap_events * max(0, k - 1)
+        if total_len + mandatory_gap > N:
+            # Should be prevented by budgeting above; fail-safe fallback that
+            # still returns a valid mask instead of returning [].
+            max_len = max(1, N - mandatory_gap)
+            if max_len <= 0:
+                return []
+            span_lengths = span_lengths[:1]
+            span_lengths[0] = min(span_lengths[0], max_len)
+            total_len = span_lengths[0]
+            k = 1
+            mandatory_gap = 0
 
-            if chosen is not None:
-                selected.append(chosen)
-                occupied.update(chosen)
+        # Number of extra index positions not covered by spans and mandatory gaps.
+        spare = N - total_len - mandatory_gap
+
+        # Sample k+1 non-negative gaps that sum to `spare`.
+        # We sample separators in a stars-and-bars representation to get a
+        # random valid layout without overlap.
+        cuts = sorted(self._rng.sample(range(spare + k), k))
+        gaps: List[int] = []
+        prev = -1
+        for c in cuts + [spare + k]:
+            gaps.append(c - prev - 1)
+            prev = c
+
+        selected: List[List[int]] = []
+        idx_ptr = gaps[0]
+        for i, span_len in enumerate(span_lengths):
+            start_idx = idx_ptr
+            end_idx = start_idx + span_len
+            candidate_pos = [real_positions[j] for j in range(start_idx, end_idx)]
+            selected.append(candidate_pos)
+            # Internal gaps include configured minimum gap + sampled slack.
+            internal_gap = gaps[i + 1] + (self.min_gap_events if i < k - 1 else 0)
+            idx_ptr = end_idx + internal_gap
 
         return selected

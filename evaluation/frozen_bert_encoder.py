@@ -16,8 +16,11 @@ train_linear_probe helper and LinearProbe class work unchanged:
 The linear probe is trained on top of the CLS representation, which is the
 standard BERT downstream evaluation protocol.
 
-Note: the model is frozen at construction time (requires_grad=False on all
-parameters).  Gradients are never computed through this module.
+Note: forward runs under ``torch.no_grad()`` so no gradients are recorded
+through the encoder.  We deliberately do **not** set ``requires_grad=False``
+on the wrapped ``BERTEHRModel`` because the same module instance may still
+be used for MLM pretraining after the probe; mutating ``requires_grad`` would
+break the next training step.
 """
 
 from __future__ import annotations
@@ -36,15 +39,13 @@ class FrozenBERTEncoder(nn.Module):
     ----------
     bert_model:
         A BERTEHRModel instance whose weights have been loaded from a checkpoint.
-        All parameters are frozen inside this wrapper.
+        Forward uses ``torch.no_grad()`` only — the wrapped weights are not
+        modified and ``requires_grad`` is left unchanged (see module docstring).
     """
 
     def __init__(self, bert_model: "BERTEHRModel") -> None:  # noqa: F821
         super().__init__()
         self.bert_model = bert_model
-
-        for p in self.parameters():
-            p.requires_grad_(False)
 
         self.output_dim: int = bert_model.output_dim
 

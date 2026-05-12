@@ -69,7 +69,7 @@ from data.collator import MEDSCollator
 from data.meds_dataset import MEDSDataset
 from data.normalizer import ValueNormalizer
 from data.vocab import build_vocab, Vocab
-from loss.covariance_reg import CovarianceRegularizationLoss
+from loss.covariance_reg import SIGRegLoss
 from masking.span_masking import SpanMasker
 from models.event_embedding import EmbeddingConfig, EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
@@ -199,11 +199,13 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
     ))
 
     prompt   = TemporalSpanPrompt(d_model)
-    cov_loss = CovarianceRegularizationLoss(d_model, proj_dim=lc.get("cov_proj_dim", 64))
+    cov_loss = SIGRegLoss(num_slices=lc.get("sigreg_num_slices", 32))
     masker   = SpanMasker(
         mask_ratio=mk.get("mask_ratio", 0.30),
         default_num_spans=mk.get("default_num_spans", 4),
         min_span_length=mk.get("min_span_length", 15),
+        min_gap_events=mk.get("min_gap_events", 0),
+        allow_overlap=mk.get("allow_overlap", False),
     )
 
     # Branch A: Perceiver poolers + latent predictor

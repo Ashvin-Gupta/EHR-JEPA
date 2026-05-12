@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from loss.covariance_reg import CovarianceRegularizationLoss
+from loss.covariance_reg import SIGRegLoss
 from masking.span_masking import SpanMasker
 from models.event_embedding import EmbeddingConfig, EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
@@ -68,7 +68,7 @@ def _build_trainer(
     prompt         = TemporalSpanPrompt(D)
     predictor      = Predictor(D, n_heads=4, n_layers=2, dropout=0.0)
     token_predictor = _build_encoder(n_layers=2)
-    cov_loss       = CovarianceRegularizationLoss(D, proj_dim=16)
+    cov_loss       = SIGRegLoss(num_slices=16)
     masker         = SpanMasker(
         mask_ratio=0.30, default_num_spans=2, min_span_length=5, seed=0
     )

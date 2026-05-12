@@ -276,7 +276,7 @@ def test_train_linear_probe_no_val():
 def test_run_inline_probe():
     """Full inline probe path: JEPATrainer._run_inline_probe."""
     from training.trainer import JEPATrainer, TrainerConfig
-    from loss.covariance_reg import CovarianceRegularizationLoss
+    from loss.covariance_reg import SIGRegLoss
     from masking.span_masking import SpanMasker
     from models.predictor import Predictor, TemporalSpanPrompt
 
@@ -286,7 +286,7 @@ def test_run_inline_probe():
     pooler   = _make_pooler()
     prompt   = TemporalSpanPrompt(d)
     pred     = Predictor(d, n_heads=4, n_layers=1)
-    cov_loss = CovarianceRegularizationLoss(d, proj_dim=8)
+    cov_loss = SIGRegLoss(num_slices=8)
     masker   = SpanMasker(mask_ratio=0.3, default_num_spans=2, min_span_length=3)
 
     trainer = JEPATrainer(

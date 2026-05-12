@@ -72,8 +72,10 @@ class FrozenEHREncoder(nn.Module):
         self.encoder   = encoder
         self.pooler    = pooler
 
-        for p in self.parameters():
-            p.requires_grad_(False)
+        # Do not call requires_grad_(False) here: this wrapper often shares
+        # embedding/encoder with the live JEPATrainer.  Freezing in place would
+        # break pretraining after an inline probe.  @torch.no_grad on forward
+        # is sufficient for probe-only evaluation.
 
         # Compute once at init as a plain int stored in __dict__.
         # Avoids the silent-failure pattern where an AttributeError inside a

@@ -41,7 +41,7 @@ flowchart TD
         buildModel --> predB["token_predictor  (Branch B)\n2-layer shallow Transformer\noperates on context+mask tokens"]
         buildModel --> ctxPool["context_pooler  (Branch A only)\nLatentCrossAttentionPool\n16 learnable queries"]
         buildModel --> tgtPool["target_pooler  (Branch A only)\nLatentCrossAttentionPool\n16 learnable queries"]
-        buildModel --> covLoss["CovarianceRegularizationLoss\nLinear(d→64) projection\nFrobenius norm vs identity"]
+        buildModel --> covLoss["SIGRegLoss\nrandom 1D projections\nEpps–Pulley vs N(0,1)"]
         buildModel --> masker["SpanMasker\nmask_ratio=0.30, 4 spans\nmin_span_length=15"]
     end
 

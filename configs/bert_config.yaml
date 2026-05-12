@@ -69,7 +69,7 @@ training:
   early_stopping_patience: 5
   early_stopping_metric: "val_loss"
 
-  n_epochs: 10
+  n_epochs: 30
 
   checkpoint_dir: "/home/ag619/EHR-JEPA-Data/bert_checkpoints"
 
@@ -78,11 +78,11 @@ training:
 # ---------------------------------------------------------------------------
 downstream:
   enabled: true
-  probe_epochs: 15
+  probe_epochs: 6
   probe_lr: 1.0e-3
   probe_dropout: 0.1
   probe_batch_size: 64
   # Limit val (tuning) loader to N files for fast inline evaluation.
   probe_max_files: 5
   # Run the inline probe every N epochs (epoch 1 always runs regardless).
-  probe_interval: 2
+  probe_interval: 5

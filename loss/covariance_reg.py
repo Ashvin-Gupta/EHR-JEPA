@@ -1,78 +1,96 @@
 """
-Covariance Regularization Loss (VICReg-style).
+SIGReg Loss (Sketched Isotropic Gaussian Regularization).
 
-Prevents representational collapse by penalising off-diagonal entries in
-the covariance matrix of the projected target embeddings.
+Replaces covariance Frobenius regularization. Encourages embeddings to match an
+isotropic Gaussian via the Epps–Pulley statistic on random 1D projections.
 
-Algorithm:
-  1. Flatten z_target to [N, d_model] — accepts any leading dimensions
-     (e.g. [B, n_latents, d] for Branch A or [B, N_span, d] for Branch B).
-  2. Project: Z_proj = Z_flat @ W   →  [N, proj_dim].
-  3. Center Z_proj along N.
-  4. Compute covariance C = (Z_proj^T @ Z_proj) / (N - 1).
-  5. Loss = || C - I ||_F  (Frobenius norm of deviation from identity).
-
-No stop_gradient is applied here — gradients flow back through Z_target
-to the target encoder.  This is the sole training signal for that encoder.
-
-Note: dimensional collapse (all embeddings becoming identical) is monitored
-separately via `train/std_dev_embeddings` logged by the trainer — it does NOT
-affect the training objective here.
+Random directions A must be identical on every GPU when using DDP: we sample A
+on CPU with ``torch.Generator.manual_seed(global_step)`` then move to device,
+so all ranks get the same matrix without relying on CUDA RNG parity.
 """
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 
 
-class CovarianceRegularizationLoss(nn.Module):
+class SIGRegLoss(nn.Module):
     """
     Parameters
     ----------
-    d_model:
-        Hidden dimension of the target embeddings.
-    proj_dim:
-        Projection dimension.  Default 64.
+    num_slices:
+        Number of random 1D projection directions (sketches) per forward pass.
     """
 
-    def __init__(self, d_model: int, proj_dim: int = 64) -> None:
+    def __init__(self, num_slices: int = 32) -> None:
         super().__init__()
-        self.proj = nn.Linear(d_model, proj_dim, bias=False)
-        self.proj_dim = proj_dim
+        self.num_slices = num_slices
 
-    def forward(self, z_target: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        z_target: torch.Tensor,
+        global_step: Optional[int] = None,
+    ) -> torch.Tensor:
         """
         Parameters
         ----------
         z_target:
-            FloatTensor of shape (..., d_model) — any number of leading dims.
-            All leading dimensions are flattened into the sample dimension N.
-            Gradients flow through this tensor — no detach here.
-
-        Returns
-        -------
-        Scalar covariance regularization loss.
+            FloatTensor of shape (..., d_model). Gradients flow through this tensor.
+        global_step:
+            Training step index. When set, seeds the CPU Generator so every rank
+            draws the same projection matrix A (required for correct DDP SIGReg).
         """
         d_model = z_target.shape[-1]
+        x = z_target.reshape(-1, d_model)
+        N_local = x.shape[0]
 
-        # Flatten all leading dims into N: (..., d_model) → (N, d_model)
-        z_flat = z_target.reshape(-1, d_model)
+        if N_local <= 1:
+            return x.new_zeros(())
 
-        # Project: (N, proj_dim)
-        z_proj = self.proj(z_flat)
+        dev = x.device
+        dtype = x.dtype
 
-        N = z_proj.shape[0]
-        if N <= 1:
-            return z_proj.new_zeros(())
+        # Sample A on CPU with a deterministic seed so all ranks share identical A.
+        g = torch.Generator(device="cpu")
+        if global_step is not None:
+            g.manual_seed(int(global_step))
+        else:
+            g.seed()
 
-        # Center along N
-        z_proj = z_proj - z_proj.mean(dim=0, keepdim=True)
+        A = torch.randn(
+            (d_model, self.num_slices),
+            generator=g,
+            dtype=torch.float32,
+        )
+        A = A.to(device=dev, dtype=dtype)
+        A = A / A.norm(p=2, dim=0, keepdim=True)
 
-        # Covariance: (proj_dim, proj_dim)
-        cov = (z_proj.T @ z_proj) / (N - 1)
+        # Integration grid for Epps–Pulley / characteristic function distance
+        t = torch.linspace(-5.0, 5.0, 17, device=dev, dtype=dtype)
+        exp_f = torch.exp(-0.5 * t**2)
 
-        # Loss: || C - I ||_F
-        identity = torch.eye(self.proj_dim, device=cov.device, dtype=cov.dtype)
-        loss = (cov - identity).norm(p="fro")
-        return loss
+        # Projections: (N_local, num_slices), then (N_local, num_slices, T)
+        proj = x @ A
+        x_t = proj.unsqueeze(-1) * t.view(1, 1, -1)
+        ecf = torch.exp(1j * x_t).mean(dim=0)
+
+        if dist.is_available() and dist.is_initialized():
+            # Average empirical CF across ranks (equal batch sizes → pooled CF).
+            ecf_c = torch.view_as_real(ecf)
+            dist.all_reduce(ecf_c, op=dist.ReduceOp.AVG)
+            ecf = torch.view_as_complex(ecf_c.contiguous())
+
+        err = (ecf - exp_f).abs().square() * exp_f
+
+        _trapz = getattr(torch, "trapezoid", torch.trapz)
+        stat = _trapz(err, t, dim=-1)
+
+        return stat.mean()
+
+
+# Backward-compatible alias (older checkpoints / docs may reference this name).
+CovarianceRegularizationLoss = SIGRegLoss

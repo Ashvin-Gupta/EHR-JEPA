@@ -348,12 +348,11 @@ JEPATrainer.forward(codes[B,L], attention_mask[B,L], values, z_scores,
 │   │   │     stop_grad on Z_tgt → gradient does NOT flow to target encoder here
 │   │   │     OUT: scalar L_pred_s
 │   │   │
-│   │   └── CovarianceRegularizationLoss.forward(Z_tgt)
+│   │   └── SIGRegLoss.forward(Z_tgt, global_step)
 │   │         Z_tgt NOT detached → gradient DOES flow to target encoder
-│   │         flatten [B, 16, d] → [B*16, d]
-│   │         project via Linear(d→64)
-│   │         center, compute covariance matrix [64, 64]
-│   │         OUT: scalar L_cov_s = ||C - I||_F
+│   │         flatten [B, 16, d] → [B*16, d]; random orthonormal directions A (CPU-seeded)
+│   │         Epps–Pulley distance of empirical CF vs N(0,1) on projections; DDP all_reduce on CF
+│   │         OUT: scalar L_cov_s
 │   │
 │   └── L_pred = mean(L_pred_s),  L_cov = mean(L_cov_s)  over valid spans
 │
@@ -396,10 +395,9 @@ JEPATrainer.forward(codes[B,L], attention_mask[B,L], values, z_scores,
         │     = MSE(Y_hat, Y_tgt.detach())
         │     OUT: scalar L_pred_s
         │
-        └── CovarianceRegularizationLoss.forward(Y_tgt)
-              flatten [B, N_span, d] → [B*N_span, d]
-              project, center, covariance
-              OUT: scalar L_cov_s = ||C - I||_F
+        └── SIGRegLoss.forward(Y_tgt, global_step)
+              flatten [B, N_span, d] → [B*N_span, d]; same SIGReg as branch A
+              OUT: scalar L_cov_s
 
     L_pred = mean(L_pred_s),  L_cov = mean(L_cov_s)  over spans
 

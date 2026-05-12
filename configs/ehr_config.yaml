@@ -50,7 +50,7 @@ model:
   #   "learned"    — trainable nn.Embedding table, top-5000 vocab + UNK.
   #   "text_based" — frozen ClinicalBERT/BioBERT embeddings + trainable
   #                  linear projection (encoder_hidden_dim → d_model).
-  embedding_type: "text_based"           # "learned" | "text_based"
+  embedding_type: "learned"           # "learned" | "text_based"
 
   # HuggingFace model name used by scripts/encode_text_embeddings.py.
   # Only relevant for text_based; ignored for learned.
@@ -80,6 +80,11 @@ masking:
   mask_ratio: 0.30
   default_num_spans: 4
   min_span_length: 15
+  # Minimum number of events between consecutive spans when allow_overlap=false.
+  min_gap_events: 0
+  # If true, target spans may overlap (i-JEPA-style).
+  # If false, spans are disjoint and cover exactly the mask budget.
+  allow_overlap: false
 
 transformer:
   n_layers: 6
@@ -107,8 +112,9 @@ latent_pooling:
   n_latents: 16
 
 loss:
-  lambda_cov: 0.1
-  cov_proj_dim: 64
+  lambda_cov: 50
+  # SIGReg: number of random 1D projections per forward (no linear proj dim).
+  sigreg_num_slices: 32
 
 training:
   # "pretrain"   — full-sequence JEPA masked pretraining.

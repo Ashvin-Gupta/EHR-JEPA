@@ -152,6 +152,125 @@ def test_t_span_floor():
     assert actual_lengths == expected_sorted
 
 
+def test_mask_budget_1024_ratio_30pct_four_spans():
+    """
+    User-specified sanity check:
+      effective context length = 1024
+      mask_ratio = 0.30  -> budget B = floor(1024 * 0.30) = 307
+      default_num_spans = 4
+
+    Expected span lengths:
+      base = 307 // 4 = 76
+      remainder = 3 -> last span gets +3
+      lengths = [76, 76, 76, 79] (order-independent)
+    """
+    masker = _masker(mask_ratio=0.30, default_num_spans=4, min_span_length=15, seed=7)
+    result = masker(seq_len=1024)
+
+    B = int(1024 * 0.30)  # 307
+    lengths = [len(s) for s in result.target_spans]
+    total_masked = sum(lengths)
+
+    assert len(result.target_spans) == 4
+    assert total_masked == B
+    assert sorted(lengths) == sorted([76, 76, 76, 79])
+
+
+def test_mask_budget_uses_effective_context_length_with_padding():
+    """
+    Effective context length is the number of real tokens, not seq_len.
+    Example:
+      seq_len=1024, but only first 600 positions are real (attention=1)
+      mask_ratio=0.30 -> budget B = floor(600 * 0.30) = 180
+    """
+    attention_mask = torch.zeros(1024, dtype=torch.long)
+    attention_mask[:600] = 1
+
+    masker = _masker(mask_ratio=0.30, default_num_spans=4, min_span_length=15, seed=11)
+    result = masker(seq_len=1024, attention_mask=attention_mask)
+
+    total_masked = sum(len(s) for s in result.target_spans)
+    assert total_masked == int(600 * 0.30)
+    # Safety: no masked position may fall in padding
+    assert all(p < 600 for span in result.target_spans for p in span)
+
+
+def test_mask_budget_is_fully_used_across_many_seeds():
+    """
+    Regression test: masking should not under-fill budget due to failed span
+    placement. Across many random seeds, total masked tokens must always equal
+    floor(N * mask_ratio) for this setup.
+    """
+    N = 512
+    ratio = 0.30
+    expected = int(N * ratio)
+    for seed in range(50):
+        masker = _masker(mask_ratio=ratio, default_num_spans=4, min_span_length=15, seed=seed)
+        result = masker(seq_len=N)
+        total_masked = sum(len(s) for s in result.target_spans)
+        assert total_masked == expected, (
+            f"seed={seed}: masked {total_masked}, expected {expected}"
+        )
+
+
+def test_allow_overlap_can_create_overlapping_targets():
+    """
+    When allow_overlap=True, overlapping spans are permitted.
+    For this seeded setup we expect at least one overlap.
+    """
+    masker = _masker(
+        mask_ratio=0.80,
+        default_num_spans=8,
+        min_span_length=1,
+        allow_overlap=True,
+        seed=1,
+    )
+    result = masker(seq_len=128)
+    all_positions = [p for span in result.target_spans for p in span]
+    # Overlap means duplicate positions exist across spans
+    assert len(all_positions) > len(set(all_positions))
+
+
+def test_min_gap_between_spans_non_overlap():
+    """
+    When allow_overlap=False and min_gap_events>0, spans must be separated by
+    at least that many events.
+    """
+    gap = 5
+    masker = _masker(
+        mask_ratio=0.30,
+        default_num_spans=4,
+        min_span_length=10,
+        min_gap_events=gap,
+        allow_overlap=False,
+        seed=3,
+    )
+    result = masker(seq_len=256)
+    spans = sorted(result.target_spans, key=lambda s: s[0])
+    for i in range(len(spans) - 1):
+        # number of untouched events between span i and i+1
+        inter = spans[i + 1][0] - spans[i][-1] - 1
+        assert inter >= gap
+
+
+def test_budget_clamped_no_empty_mask_when_ratio_exceeds_one():
+    """
+    Even with invalid mask_ratio > 1, budget must be clamped and produce a
+    valid non-empty mask (not silently return []).
+    """
+    masker = _masker(
+        mask_ratio=1.5,        # intentionally invalid
+        default_num_spans=4,
+        min_span_length=1,
+        allow_overlap=False,
+        seed=9,
+    )
+    result = masker(seq_len=64)
+    total_masked = sum(len(s) for s in result.target_spans)
+    assert total_masked > 0
+    assert total_masked <= 64
+
+
 def test_empty_sequence():
     """When B=0 (seq too short for any masks at given ratio), return empty results."""
     # seq_len=2, mask_ratio=0.30 → B = int(2*0.30) = 0
@@ -174,6 +293,12 @@ if __name__ == "__main__":
         test_padding_excluded,
         test_span_times,
         test_t_span_floor,
+        test_mask_budget_1024_ratio_30pct_four_spans,
+        test_mask_budget_uses_effective_context_length_with_padding,
+        test_mask_budget_is_fully_used_across_many_seeds,
+        test_allow_overlap_can_create_overlapping_targets,
+        test_min_gap_between_spans_non_overlap,
+        test_budget_clamped_no_empty_mask_when_ratio_exceeds_one,
         test_empty_sequence,
     ]
     passed = failed = 0
