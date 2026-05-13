@@ -23,7 +23,7 @@ normalizer:
 
 model:
   d_model: 768
-  embedding_type: "text_based"
+  embedding_type: "learned"
   text_encoder: "emilyalsentzer/Bio_ClinicalBERT"
   code_embeddings_path: "/home/ag619/EHR-JEPA-Data/code_embeddings.pt"
   encoder_hidden_dim: 768
@@ -77,7 +77,8 @@ training:
 # Inline downstream evaluation — same structure as ehr_config.yaml
 # ---------------------------------------------------------------------------
 downstream:
-  enabled: true
+  enabled: false
+  inline_probe_during_pretrain: false
   probe_epochs: 6
   probe_lr: 1.0e-3
   probe_dropout: 0.1
@@ -86,3 +87,17 @@ downstream:
   probe_max_files: 5
   # Run the inline probe every N epochs (epoch 1 always runs regardless).
   probe_interval: 5
+
+# Supervised downstream (main_supervised_downstream.py) — mirror ehr_config downstream_eval
+downstream_eval:
+  mode: bert
+  head_type: linear
+  head_dropout: 0.1
+  run_fraction_sweep: false
+  train_fractions: [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
+  val_max_files: 5
+  n_epochs: 10
+  lr: 1.0e-4
+  weight_decay: 0.01
+  batch_size: 32
+  checkpoint_path: null

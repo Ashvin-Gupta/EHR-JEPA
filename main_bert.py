@@ -372,6 +372,7 @@ def main(config_path: str, no_wandb: bool = False) -> None:
         probe_lr=ds_cfg.get("probe_lr", 1e-3),
         probe_dropout=ds_cfg.get("probe_dropout", 0.1),
         probe_interval=ds_cfg.get("probe_interval", 1),
+        inline_probe_during_pretrain=ds_cfg.get("inline_probe_during_pretrain", True),
         ddp_module=ddp_trainer,
         is_main_process=is_main,
         train_sampler=train_sampler,

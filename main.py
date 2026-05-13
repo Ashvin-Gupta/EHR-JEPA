@@ -427,6 +427,9 @@ def build_probe_loaders(
     cfg: dict,
     vocab: Vocab | None,
     normalizer: ValueNormalizer | None,
+    *,
+    force: bool = False,
+    val_max_files_override: int | None = None,
 ) -> tuple[DataLoader | None, DataLoader | None, DataLoader | None]:
     """
     Build train/val/test DataLoaders for inline linear-probe evaluation.
@@ -434,11 +437,16 @@ def build_probe_loaders(
     Returns (None, None, None) if downstream evaluation is disabled in the
     config or the required label files do not exist.
 
-    The test (held_out) loader is built but only used after training to
-    evaluate the best-AUROC checkpoint on the held-out set.
+    Parameters
+    ----------
+    force:
+        When True, build loaders even if ``downstream.enabled`` is false
+        (for standalone supervised evaluation scripts).
+    val_max_files_override:
+        If set, overrides ``downstream.probe_max_files`` for the tuning val loader.
     """
     ds_cfg = cfg.get("downstream", {})
-    if not ds_cfg.get("enabled", False):
+    if not force and not ds_cfg.get("enabled", False):
         return None, None, None
 
     data_cfg = cfg["data"]
@@ -475,7 +483,11 @@ def build_probe_loaders(
     pin_memory   = bool(tr.get("pin_memory", True)) and torch.cuda.is_available()
     # Limit source parquet files for the val (tuning) loader only — keeps
     # inline probe evaluation fast while training always uses the full dataset.
-    val_max_files = ds_cfg.get("probe_max_files", None)
+    val_max_files = (
+        val_max_files_override
+        if val_max_files_override is not None
+        else ds_cfg.get("probe_max_files", None)
+    )
 
     # Train loader always uses ALL files — no file limit.
     probe_train = _make_probe_loader(
@@ -880,6 +892,7 @@ def main(config_path: str, no_wandb: bool = False) -> None:
         probe_lr=ds_cfg.get("probe_lr", 1e-3),
         probe_dropout=ds_cfg.get("probe_dropout", 0.1),
         probe_interval=ds_cfg.get("probe_interval", 1),
+        inline_probe_during_pretrain=ds_cfg.get("inline_probe_during_pretrain", True),
         ddp_module=ddp_trainer,
         is_main_process=is_main,
         train_sampler=train_sampler,

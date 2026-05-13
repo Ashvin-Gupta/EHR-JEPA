@@ -53,6 +53,8 @@ from torch.utils.data import DataLoader
 from models.event_embedding import EventEmbedding
 from models.transformer_encoder import EHRTransformerEncoder, TransformerEncoderConfig
 
+from training.checkpoint_utils import save_bert_split_checkpoints
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -143,6 +145,62 @@ class BERTEHRModel(nn.Module):
             nn.Linear(d_model, vocab_size),
         )
 
+    def _encode_with_cls(
+        self,
+        input_codes: torch.Tensor,
+        attention_mask: torch.Tensor,
+        values: Optional[torch.Tensor] = None,
+        z_scores: Optional[torch.Tensor] = None,
+        delta_times: Optional[torch.Tensor] = None,
+        value_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, int]:
+        """
+        Embed tokens, prepend [CLS], run encoder. Returns (h, L_event) where
+        h is (B, L+1, d) and L_event is the original event length (before CLS).
+        """
+        B, L = input_codes.shape
+
+        is_mask = (input_codes == self.mask_token_idx)
+        safe_codes = input_codes.masked_fill(is_mask, 0)
+
+        x = self.embedding(
+            safe_codes,
+            values=values,
+            z_scores=z_scores,
+            delta_times=delta_times,
+            value_mask=value_mask.float() if value_mask is not None else None,
+        )
+
+        if is_mask.any():
+            mask_vec = self.mask_embedding.view(1, 1, -1).expand(B, L, -1)
+            x = torch.where(is_mask.unsqueeze(-1), mask_vec, x)
+
+        cls = self.cls_token.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)
+        x = torch.cat([cls, x], dim=1)
+
+        cls_mask = attention_mask.new_ones(B, 1)
+        full_mask = torch.cat([cls_mask, attention_mask], dim=1)
+
+        pos_ids = torch.arange(L + 1, device=x.device).unsqueeze(0).expand(B, -1)
+
+        h = self.encoder(x, attention_mask=full_mask, position_ids=pos_ids)
+        return h, L
+
+    def encode_cls_embedding(
+        self,
+        input_codes: torch.Tensor,
+        attention_mask: torch.Tensor,
+        values: Optional[torch.Tensor] = None,
+        z_scores: Optional[torch.Tensor] = None,
+        delta_times: Optional[torch.Tensor] = None,
+        value_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """CLS vector (B, d_model) for supervised fine-tuning (no MLM loss)."""
+        h, _L = self._encode_with_cls(
+            input_codes, attention_mask, values, z_scores, delta_times, value_mask
+        )
+        return h[:, 0, :]
+
     @property
     def output_dim(self) -> int:
         return self.encoder.config.d_model
@@ -172,51 +230,13 @@ class BERTEHRModel(nn.Module):
             mlm_loss      — scalar CrossEntropyLoss over masked positions
             cls_embedding — FloatTensor (B, d_model)
         """
-        B, L = input_codes.shape
+        h, _L = self._encode_with_cls(
+            input_codes, attention_mask, values, z_scores, delta_times, value_mask
+        )
+        cls_embedding = h[:, 0, :]
 
-        # MLMCollator marks masked positions with mask_token_idx = vocab_size,
-        # which is out-of-range for the embedding table (valid: 0 … vocab_size-1).
-        # We must swap those indices for a safe value before the lookup, then
-        # overwrite the resulting vectors with the learnable mask_embedding.
-        is_mask  = (input_codes == self.mask_token_idx)          # (B, L) bool
-        safe_codes = input_codes.masked_fill(is_mask, 0)         # 0 is always valid
-
-        # Embed event tokens using safe (in-range) codes
-        x = self.embedding(
-            safe_codes,
-            values=values,
-            z_scores=z_scores,
-            delta_times=delta_times,
-            value_mask=value_mask.float() if value_mask is not None else None,
-        )  # (B, L, d_model)
-
-        # Overwrite masked positions with the dedicated [MASK] embedding
-        if is_mask.any():
-            mask_vec = self.mask_embedding.view(1, 1, -1).expand(B, L, -1)
-            x = torch.where(is_mask.unsqueeze(-1), mask_vec, x)
-
-        # Prepend [CLS] token
-        cls = self.cls_token.unsqueeze(0).unsqueeze(0).expand(B, 1, -1)  # (B, 1, d_model)
-        x   = torch.cat([cls, x], dim=1)                                   # (B, L+1, d_model)
-
-        # Extend attention mask: CLS position is always real (1)
-        cls_mask  = attention_mask.new_ones(B, 1)
-        full_mask = torch.cat([cls_mask, attention_mask], dim=1)            # (B, L+1)
-
-        # Shift event position IDs so CLS gets position 0
-        # (EHRTransformerEncoder defaults to arange(L) internally; we pass
-        # explicit position_ids so CLS is 0 and events are 1…L)
-        pos_ids = torch.arange(L + 1, device=x.device).unsqueeze(0).expand(B, -1)
-
-        # Encode
-        h = self.encoder(x, attention_mask=full_mask, position_ids=pos_ids)  # (B, L+1, d)
-
-        # CLS output
-        cls_embedding = h[:, 0, :]      # (B, d_model)
-
-        # MLM loss — only over event positions (columns 1…L), not the CLS slot
-        token_h = h[:, 1:, :]           # (B, L, d_model)
-        logits  = self.mlm_head(token_h)                  # (B, L, vocab_size)
+        token_h = h[:, 1:, :]
+        logits = self.mlm_head(token_h)
         mlm_loss = F.cross_entropy(
             logits.view(-1, logits.shape[-1]),
             mlm_labels.view(-1),
@@ -327,6 +347,7 @@ class BERTTrainer(nn.Module):
         probe_lr:           float = 1e-3,
         probe_dropout:      float = 0.1,
         probe_interval:     int   = 1,   # run probe every N epochs; always runs on epoch 1
+        inline_probe_during_pretrain: bool = True,
         # ---- DDP ----
         ddp_module: Optional[nn.Module] = None,
         is_main_process: bool = True,
@@ -460,7 +481,8 @@ class BERTTrainer(nn.Module):
 
                 # Inline probe — epoch 1 always; then every probe_interval epochs
                 _run_probe = (
-                    probe_train_loader is not None
+                    inline_probe_during_pretrain
+                    and probe_train_loader is not None
                     and ((epoch + 1) == 1 or (epoch + 1) % max(1, probe_interval) == 0)
                 )
                 probe_metrics: Dict[str, float] = {}
@@ -497,6 +519,7 @@ class BERTTrainer(nn.Module):
                         "optimizer_state": optimizer.state_dict(),
                     }
                     torch.save(ckpt_payload, os.path.join(ckpt_dir, "last.pt"))
+                    save_bert_split_checkpoints(ckpt_payload["model_state"], ckpt_dir)
                     if ckpt_monitor < best_ckpt_metric:
                         best_ckpt_metric = ckpt_monitor
                         torch.save(ckpt_payload, os.path.join(ckpt_dir, "best.pt"))
@@ -556,3 +579,4 @@ class BERTTrainer(nn.Module):
 
         self.train()
         return total / max(n, 1)
+

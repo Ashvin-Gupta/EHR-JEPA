@@ -16,6 +16,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from torch.distributed.nn.functional import all_reduce as dist_all_reduce
 
 
 class SIGRegLoss(nn.Module):
@@ -34,6 +35,7 @@ class SIGRegLoss(nn.Module):
         self,
         z_target: torch.Tensor,
         global_step: Optional[int] = None,
+        sync_ddp: bool = True,
     ) -> torch.Tensor:
         """
         Parameters
@@ -43,6 +45,9 @@ class SIGRegLoss(nn.Module):
         global_step:
             Training step index. When set, seeds the CPU Generator so every rank
             draws the same projection matrix A (required for correct DDP SIGReg).
+        sync_ddp:
+            When True, averages the empirical characteristic function across ranks.
+            Set False when only rank 0 runs evaluation.
         """
         d_model = z_target.shape[-1]
         x = z_target.reshape(-1, d_model)
@@ -78,10 +83,12 @@ class SIGRegLoss(nn.Module):
         x_t = proj.unsqueeze(-1) * t.view(1, 1, -1)
         ecf = torch.exp(1j * x_t).mean(dim=0)
 
-        if dist.is_available() and dist.is_initialized():
-            # Average empirical CF across ranks (equal batch sizes → pooled CF).
+        if sync_ddp and dist.is_available() and dist.is_initialized():
+            # Average empirical CF across ranks with autograd-enabled collective.
             ecf_c = torch.view_as_real(ecf)
-            dist.all_reduce(ecf_c, op=dist.ReduceOp.AVG)
+            world_size = dist.get_world_size()
+            ecf_c = dist_all_reduce(ecf_c, op=dist.ReduceOp.SUM)
+            ecf_c = ecf_c / float(world_size)
             ecf = torch.view_as_complex(ecf_c.contiguous())
 
         err = (ecf - exp_f).abs().square() * exp_f

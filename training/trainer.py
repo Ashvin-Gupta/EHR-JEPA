@@ -49,6 +49,8 @@ from models.predictor import Predictor, TemporalSpanPrompt
 from models.projection_head import ProjectionHead
 from models.transformer_encoder import EHRTransformerEncoder
 
+from training.checkpoint_utils import save_jepa_split_checkpoints
+
 
 @dataclass
 class TrainerConfig:
@@ -150,6 +152,9 @@ class JEPATrainer(nn.Module):
 
         # Training step for SIGReg RNG sync across DDP ranks (set each batch).
         self._cov_global_step: int = 0
+        # Whether SIGReg should synchronize its statistic across DDP ranks.
+        # Disable during rank-0-only validation to avoid collective mismatch.
+        self._cov_sync_ddp: bool = True
 
         # Learnable mask token for Branch B
         d_model = encoder.config.d_model
@@ -500,7 +505,11 @@ class JEPATrainer(nn.Module):
 
             pred_losses.append(jepa_prediction_loss(Z_hat, Z_tgt))
             cov_losses.append(
-                self.cov_loss(Z_tgt, global_step=self._cov_global_step)
+                self.cov_loss(
+                    Z_tgt,
+                    global_step=self._cov_global_step,
+                    sync_ddp=self._cov_sync_ddp,
+                )
             )
 
         if not pred_losses:
@@ -577,7 +586,11 @@ class JEPATrainer(nn.Module):
 
             pred_losses.append(jepa_prediction_loss(y_hat, y_tgt))
             cov_losses.append(
-                self.cov_loss(y_tgt, global_step=self._cov_global_step)
+                self.cov_loss(
+                    y_tgt,
+                    global_step=self._cov_global_step,
+                    sync_ddp=self._cov_sync_ddp,
+                )
             )
 
         if not pred_losses:
@@ -891,6 +904,7 @@ class JEPATrainer(nn.Module):
         probe_lr:           float = 1e-3,
         probe_dropout:      float = 0.1,
         probe_interval:     int   = 1,   # run probe every N epochs; always runs on epoch 1
+        inline_probe_during_pretrain: bool = True,
         # ---- DDP ----
         ddp_module: Optional[nn.Module] = None,
         is_main_process: bool = True,
@@ -1142,7 +1156,8 @@ class JEPATrainer(nn.Module):
             # ---- Inline probe evaluation (all ranks when DDP is active) --------
             # Run on epoch 1 unconditionally, then every probe_interval epochs.
             _run_probe_this_epoch = (
-                probe_train_loader is not None
+                inline_probe_during_pretrain
+                and probe_train_loader is not None
                 and ((epoch + 1) == 1 or (epoch + 1) % max(1, probe_interval) == 0)
             )
             probe_metrics: Dict[str, float] = {}
@@ -1190,6 +1205,7 @@ class JEPATrainer(nn.Module):
                     "optimizer_state": optimizer.state_dict(),
                 }
                 torch.save(ckpt_payload, os.path.join(ckpt_dir, "last.pt"))
+                save_jepa_split_checkpoints(ckpt_payload["model_state"], ckpt_dir)
                 if ckpt_monitor < best_ckpt_metric:
                     best_ckpt_metric = ckpt_monitor
                     torch.save(ckpt_payload, os.path.join(ckpt_dir, "best.pt"))
@@ -1254,45 +1270,50 @@ class JEPATrainer(nn.Module):
         std_dev_sum   = 0.0
         emb_buffer: List[torch.Tensor] = []
         emb_collected = 0
+        prev_cov_sync = self._cov_sync_ddp
+        self._cov_sync_ddp = False
 
-        for batch in loader:
-            codes       = batch["codes"].to(device, non_blocking=True)
-            attn_mask   = batch["attention_mask"].to(device, non_blocking=True)
-            values      = batch.get("values")
-            z_scores    = batch.get("z_scores")
-            delta_times = batch.get("delta_times")
-            value_mask  = batch.get("value_mask")
-            if values      is not None: values      = values.to(device, non_blocking=True)
-            if z_scores    is not None: z_scores    = z_scores.to(device, non_blocking=True)
-            if delta_times is not None: delta_times = delta_times.to(device, non_blocking=True)
-            if value_mask  is not None: value_mask  = value_mask.to(device, non_blocking=True)
-            pre_mask = (
-                {
-                    "mask_context_indices": batch["mask_context_indices"],
-                    "mask_target_spans":    batch["mask_target_spans"],
-                    "mask_span_times":      batch["mask_span_times"],
-                }
-                if "mask_context_indices" in batch else None
-            )
+        try:
+            for batch in loader:
+                codes       = batch["codes"].to(device, non_blocking=True)
+                attn_mask   = batch["attention_mask"].to(device, non_blocking=True)
+                values      = batch.get("values")
+                z_scores    = batch.get("z_scores")
+                delta_times = batch.get("delta_times")
+                value_mask  = batch.get("value_mask")
+                if values      is not None: values      = values.to(device, non_blocking=True)
+                if z_scores    is not None: z_scores    = z_scores.to(device, non_blocking=True)
+                if delta_times is not None: delta_times = delta_times.to(device, non_blocking=True)
+                if value_mask  is not None: value_mask  = value_mask.to(device, non_blocking=True)
+                pre_mask = (
+                    {
+                        "mask_context_indices": batch["mask_context_indices"],
+                        "mask_target_spans":    batch["mask_target_spans"],
+                        "mask_span_times":      batch["mask_span_times"],
+                    }
+                    if "mask_context_indices" in batch else None
+                )
 
-            _, _, l_total = self.forward(
-                codes, attn_mask, values, z_scores, delta_times, value_mask,
-                pre_mask=pre_mask,
-            )
-            total += l_total.item()
-            n += 1
+                _, _, l_total = self.forward(
+                    codes, attn_mask, values, z_scores, delta_times, value_mask,
+                    pre_mask=pre_mask,
+                )
+                total += l_total.item()
+                n += 1
 
-            std_dev_sum += self._batch_mon.get("std_dev_embeddings", 0.0)
+                std_dev_sum += self._batch_mon.get("std_dev_embeddings", 0.0)
 
-            # Collect target embeddings for epoch-level RankMe
-            if emb_collected < rank_me_max_samples:
-                tgt_embs = self._batch_mon.get("_tgt_embs_for_rank")
-                if tgt_embs is not None:
-                    tgt_embs = tgt_embs.cpu()
-                    need = rank_me_max_samples - emb_collected
-                    take = min(need, tgt_embs.shape[0])
-                    emb_buffer.append(tgt_embs[:take])
-                    emb_collected += take
+                # Collect target embeddings for epoch-level RankMe
+                if emb_collected < rank_me_max_samples:
+                    tgt_embs = self._batch_mon.get("_tgt_embs_for_rank")
+                    if tgt_embs is not None:
+                        tgt_embs = tgt_embs.cpu()
+                        need = rank_me_max_samples - emb_collected
+                        take = min(need, tgt_embs.shape[0])
+                        emb_buffer.append(tgt_embs[:take])
+                        emb_collected += take
+        finally:
+            self._cov_sync_ddp = prev_cov_sync
 
         avg_loss   = total       / max(n, 1)
         avg_std_dev = std_dev_sum / max(n, 1)
