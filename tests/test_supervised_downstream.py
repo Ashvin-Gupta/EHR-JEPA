@@ -5,6 +5,7 @@ from __future__ import annotations
 import torch
 
 from evaluation.bert_supervised import BERTSupervisedClassifier
+from evaluation.supervised_cls import SupervisedCLSClassifier
 from evaluation.supervised_perceiver import SupervisedPerceiverClassifier
 from models.event_embedding import EmbeddingConfig, EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
@@ -57,6 +58,23 @@ def test_supervised_perceiver_forward_backward():
     loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels)
     loss.backward()
     assert emb.embedding.weight.grad is not None
+
+
+def test_supervised_cls_forward_backward():
+    d = 16
+    emb = _tiny_vocab_embedding(d)
+    enc = _tiny_encoder(d)
+    cls_token = torch.nn.Parameter(torch.randn(d) * 0.02)
+    model = SupervisedCLSClassifier(emb, enc, cls_token, head_type="linear", head_dropout=0.0)
+    B, L = 2, 10
+    codes = torch.randint(0, 31, (B, L))
+    attn = torch.ones(B, L, dtype=torch.long)
+    labels = torch.tensor([0.0, 1.0])
+    logits = model(codes, attn)
+    assert logits.shape == (B,)
+    loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels)
+    loss.backward()
+    assert cls_token.grad is not None
 
 
 def test_bert_supervised_forward_backward():

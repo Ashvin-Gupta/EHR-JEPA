@@ -13,13 +13,16 @@ DATA_DIR defaults to /home/ag619/clean_meds_debug but can be overridden:
     DATA_DIR=/other/path pytest tests/test_integration_real_data.py -v -s
 """
 
-import sys
 import os
+import sys
+from typing import List
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 DATA_DIR   = os.environ.get("DATA_DIR",   "/home/ag619/clean_meds_debug")
 LOOKUP_DIR = os.environ.get("LOOKUP_DIR", "/home/ag619/MIMIC_data/hosp")
 
+import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
@@ -475,15 +478,16 @@ def test_sequence_length_histogram():
     print(f"  Mean length:  {mean_len:.1f}")
     print(f"  Median:       {median_len}")
 
-    # ---- Full-range plot (bin=1, log y-axis to handle extreme outliers) ----
+    # ---- Full range: log x (sequence length), log y (count tail) ----
     fig, axes = plt.subplots(1, 2, figsize=(16, 5))
     fig.suptitle("Patient sequence length distribution", fontsize=13, fontweight="bold")
 
     # Left panel: full range
     ax = axes[0]
     ax.hist(lengths, bins=range(min_len, max_len + 2), color="#4C72B0", edgecolor="none")
+    ax.set_xscale("log")
     ax.set_yscale("log")
-    ax.set_xlabel("Sequence length (events per patient)", fontsize=11)
+    ax.set_xlabel("Sequence length (events per patient, log scale)", fontsize=11)
     ax.set_ylabel("Number of patients (log scale)", fontsize=11)
     ax.set_title(f"Full range  [1 – {max_len:,}]", fontsize=11)
     ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
@@ -496,12 +500,13 @@ def test_sequence_length_histogram():
     ax.axvline(512, color="black", linestyle=":", linewidth=1.5, label="context=512")
     ax.legend(fontsize=9)
 
-    # Right panel: zoomed to ≤ 1500 (where most patients live) with linear y
+    # Right panel: zoomed to ≤ 1500, log x, linear y
     zoom_max = 1500
     zoomed = [l for l in lengths if l <= zoom_max]
     ax2 = axes[1]
     ax2.hist(zoomed, bins=range(min_len, zoom_max + 2), color="#4C72B0", edgecolor="none")
-    ax2.set_xlabel("Sequence length (events per patient)", fontsize=11)
+    ax2.set_xscale("log")
+    ax2.set_xlabel("Sequence length (events per patient, log scale)", fontsize=11)
     ax2.set_ylabel("Number of patients", fontsize=11)
     ax2.set_title(
         f"Zoomed: ≤ {zoom_max:,} events  ({len(zoomed)}/{len(lengths)} patients, "
@@ -539,6 +544,103 @@ def test_sequence_length_histogram():
     print("  PASS")
 
 
+def _events_per_trajectory_window_counts(events, window_hours: float) -> List[int]:
+    """
+    For one subject, anchor at **trajectory start** ``t0`` = earliest non-null event time.
+    Split wall-clock time into consecutive half-open windows of length ``W`` hours::
+
+        [t0, t0 + W), [t0 + W, t0 + 2W), ...
+
+    Return one integer per window index (0, 1, …, K): number of events whose
+    time falls in that window. **Not** inter-event gaps: each event is placed by
+    absolute time since ``t0``. Windows with no events are **0** between the
+    first and last index that contains any event, so indices are contiguous
+    along the stay (e.g. for W=24: “events on first day”, “second day”, …).
+    """
+    w = pd.Timedelta(hours=float(window_hours))
+    valid = [e for e in events if pd.notna(e.time)]
+    if not valid:
+        return []
+    t0 = min(e.time for e in valid)
+    by_block = {}
+    for e in valid:
+        k = int((e.time - t0) / w)
+        by_block[k] = by_block.get(k, 0) + 1
+    max_k = max(by_block)
+    return [by_block.get(i, 0) for i in range(max_k + 1)]
+
+
+# ---------------------------------------------------------------------------
+# 11. Events per fixed-duration time block (1–24 h), 3×2 histograms
+# ---------------------------------------------------------------------------
+
+def test_time_block_event_histograms():
+    print("\n" + "="*60)
+    print("TEST 11: Events per trajectory window (1–24 h blocks from earliest time)")
+    print("="*60)
+
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+
+    window_hours = (1, 2, 4, 8, 12, 24)
+    df = load_split(DATA_DIR, "train")
+    seqs = build_subject_sequences(df)
+
+    fig, axes = plt.subplots(3, 2, figsize=(12, 12))
+    axes_flat = axes.flatten()
+    fig.suptitle(
+        "Each subject: from earliest event time t₀, count events in [t₀, t₀+W), then "
+        "[t₀+W, t₀+2W), … (not time-between-events).\n"
+        "Histogram: across all subjects, how many such windows had each event count.",
+        fontsize=11,
+        fontweight="bold",
+    )
+
+    for ax, wh in zip(axes_flat, window_hours):
+        all_counts: List[int] = []
+        for events in seqs.values():
+            all_counts.extend(_events_per_trajectory_window_counts(events, wh))
+
+        if not all_counts:
+            ax.set_title(f"{wh:g} h — no data")
+            continue
+
+        hi = max(all_counts)
+        # Integer-centered bins when modest span; else fixed number of equal-width bins
+        if hi <= 300:
+            bins = np.arange(-0.5, hi + 1.5, 1.0)
+        else:
+            bins = 150
+        ax.hist(
+            all_counts,
+            bins=bins,
+            range=None if hi <= 300 else (0, hi + 1),
+            color="#2ca02c",
+            edgecolor="none",
+        )
+        ax.set_xlabel(f"Events in one {wh:g}-h window [t₀+k·{wh:g}h, t₀+(k+1)·{wh:g}h)")
+        ax.set_ylabel("Number of blocks (all subjects, log scale)")
+        mean_c = float(np.mean(all_counts))
+        n_zero = sum(1 for c in all_counts if c == 0)
+        ax.set_title(
+            f"{wh:g}-h blocks  n_blocks={len(all_counts):,}  mean={mean_c:.2f}  "
+            f"empty={100 * n_zero / len(all_counts):.1f}%"
+        )
+        ax.set_yscale("log")
+        ax.set_ylim(bottom=0.8)
+        ax.yaxis.set_major_formatter(ticker.ScalarFormatter())
+
+    plt.tight_layout()
+    out_path = os.path.join(os.path.dirname(__file__), "events_per_time_block_histograms.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"\n  Figure saved to: {out_path}")
+    print(f"  Window sizes (h): {list(window_hours)}")
+    print("  PASS")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -558,6 +660,7 @@ if __name__ == "__main__":
         test_event_embedding_forward,
         test_sequence_length_stats,
         test_sequence_length_histogram,
+        test_time_block_event_histograms,
     ]
 
     passed = 0

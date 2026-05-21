@@ -165,3 +165,17 @@ Both `CtxEnc` and `TgtEnc` are the **same `nn.Module` instance** — the shared 
 | Predicted tokens | `Y_hat` | `[B, N_span, d_model]` |
 | **Losses** | | |
 | All losses | `L_pred`, `L_cov`, `L_total` | scalar |
+
+---
+
+## Masking strategies (pretrain)
+
+| `masking.strategy` | Cuts per sample | Collator batch keys | Encoder passes (typical) |
+|--------------------|-----------------|---------------------|--------------------------|
+| `span_budget` | Multiple random spans | `mask_context_indices`, `mask_target_spans` | 1 target + 1 context |
+| `causal_single` | Random `s` (context start) + random cut `t` in `[s, last_real]`; context `[s,t]`, target `(t, last_real]` | Same as span (one target span) | 1 target + 1 context |
+| `causal_future` | `num_cutpoints_S` independent cuts | `mask_causal_contexts`, `mask_causal_targets` | 1 target + up to S context |
+
+All causal cutpoints are chosen on the **windowed** sequence after `MEDSCollator` (random slice if longer than `max_seq_len`, else pad). `causal_single` is the efficient default when you want temporal prediction without multi-cut context encoder cost.
+
+**Branch B + `causal_single`:** target encoder on `[CLS | events]`; context prefix re-encoded; predictor input is **compact** `[CLS | context_enc | learnable MASK@future]` (RoPE: CLS at 0, events at original indices). `predictor.causal_single_attn`: `bidirectional` or `quadrant` (CLS/context cannot attend to MASK slots; MASK slots may attend to CLS+context; target↔target diagonal). **Downstream** probe / supervised CLS uses **encoder** `[CLS | events]` from the target pathway, not predictor outputs. Optional time-decay on target tokens. Invalid rows skipped before the predictor batch.

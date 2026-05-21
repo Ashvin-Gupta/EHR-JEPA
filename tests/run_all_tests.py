@@ -29,6 +29,10 @@ import tests.test_normalizer            as _tn
 import tests.test_event_embedding_mlp   as _te
 import tests.test_transformer_encoder   as _tt
 import tests.test_span_masking          as _ts
+import tests.test_causal_future_masking as _tcf
+import tests.test_causal_single_cut_masking as _tcsc
+import tests.test_causal_single_forward as _tcsf
+import tests.test_causal_single_attn_mask as _tcsam
 import tests.test_latent_pooling        as _tl
 import tests.test_predictor             as _tp
 import tests.test_losses                as _tloss
@@ -95,6 +99,49 @@ SUITES = {
             _ts.test_empty_sequence,
         ],
     ),
+    "causal_future_masking": (
+        "CausalFutureMasker — S pairs, time/event caps, no leakage",
+        [
+            _tcf.test_no_future_in_context,
+            _tcf.test_target_respects_64_events,
+            _tcf.test_target_respects_12h,
+            _tcf.test_capped_context_shorter_than_prefix,
+            _tcf.test_min_target_events_skips_pair_when_impossible,
+            _tcf.test_non_empty_targets_meet_min_events,
+            _tcf.test_padding_positions_ignored,
+        ],
+    ),
+    "causal_single_cut_masking": (
+        "CausalSingleCutMasker — random context_start + cut, span batch keys",
+        [
+            _tcsc.test_single_span_output_shape,
+            _tcsc.test_no_future_in_context,
+            _tcsc.test_target_respects_max_events,
+            _tcsc.test_target_respects_max_hours,
+            _tcsc.test_min_context_events,
+            _tcsc.test_target_delta_minutes_from_cut,
+            _tcsc.test_impossible_sequence_returns_empty_target,
+            _tcsc.test_padding_positions_ignored,
+        ],
+    ),
+    "causal_single_forward": (
+        "causal_single Branch B — finite loss across sequence lengths",
+        [
+            _tcsf.test_causal_single_finite_across_seq_lengths,
+            _tcsf.test_causal_single_short_padded_sequence,
+            _tcsf.test_causal_single_all_invalid_targets_returns_zero_loss,
+        ],
+    ),
+    "causal_single_attn_mask": (
+        "causal_single quadrant predictor self-attention mask",
+        [
+            _tcsam.test_quadrant_mask_four_blocks,
+            _tcsam.test_quadrant_mask_cls_attention,
+            _tcsam.test_quadrant_mask_batch_padded_row,
+            _tcsam.test_quadrant_forward_finite,
+            _tcsam.test_unknown_attn_mode_raises,
+        ],
+    ),
     "latent_pooling": (
         "LatentCrossAttentionPool — Perceiver-style cross-attention",
         [
@@ -126,6 +173,9 @@ SUITES = {
             _tloss.test_jepa_loss_positive,
             _tloss.test_jepa_loss_no_grad_through_target,
             _tloss.test_jepa_loss_scalar,
+            _tloss.test_jepa_loss_weighted_near_term_dominates,
+            _tloss.test_time_decay_weight_floor,
+            _tloss.test_jepa_loss_weighted_no_grad_through_target,
             _tloss.test_sigreg_loss_shape,
             _tloss.test_sigreg_deterministic_given_global_step,
             _tloss.test_sigreg_gradients_flow,
@@ -149,6 +199,12 @@ SUITES = {
             _tf.test_losses_positive_branch_a,
             _tf.test_losses_positive_branch_b,
             _tf.test_short_sequence,
+            _tf.test_causal_single_token_compact_forward_finite,
+            _tf.test_causal_single_empty_target_row_still_finite,
+            _tf.test_causal_single_time_decay_loss_branch_b,
+            _tf.test_causal_single_span_pre_mask_forward,
+            _tf.test_causal_multi_cut_pre_mask_forward,
+            _tf.test_causal_skips_cut_when_any_row_has_empty_context,
             _tf.test_shared_encoder_weights,
         ],
     ),
@@ -165,6 +221,7 @@ SUITES = {
             _tint.test_event_embedding_forward,
             _tint.test_sequence_length_stats,
             _tint.test_sequence_length_histogram,
+            _tint.test_time_block_event_histograms,
         ],
     ),
 }
@@ -175,6 +232,10 @@ DEFAULT_ORDER = [
     "event_embedding",
     "transformer_encoder",
     "span_masking",
+    "causal_future_masking",
+    "causal_single_cut_masking",
+    "causal_single_forward",
+    "causal_single_attn_mask",
     "latent_pooling",
     "predictor",
     "losses",

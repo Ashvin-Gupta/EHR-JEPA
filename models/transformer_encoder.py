@@ -264,19 +264,27 @@ class EHRTransformerEncoder(nn.Module):
         x: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        attn_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         attention_mask: (B, L) with 1=real, 0=pad.
+        attn_bias: optional additive mask, 0 = attend, -inf = block.
+            Shapes (L, L), (B, L, L), or (B, 1, L, L).  Combined with padding.
         Internally converted to key_padding_mask (True = ignore).
         """
         key_padding_mask: Optional[torch.Tensor] = None
         if attention_mask is not None:
             key_padding_mask = attention_mask == 0   # (B, L), True on pad
 
+        attn_mask = attn_bias
+        if attn_mask is not None and attn_mask.dim() == 3:
+            attn_mask = attn_mask.unsqueeze(1)
+
         for layer in self.layers:
             x = layer(
                 x,
                 key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
                 position_ids=position_ids,
             )
 

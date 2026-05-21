@@ -2,7 +2,7 @@
 Split full-model checkpoints into resume-friendly bundles.
 
 JEPA (JEPATrainer.state_dict):
-  - backbone.pt   — EventEmbedding + shared encoder only
+  - backbone.pt   — EventEmbedding + shared encoder + cls_token
   - jepa_aux.pt   — poolers, predictor, SIGReg-free aux modules, etc.
 
 BERT (BERTTrainer.state_dict, keys under ``model.``):
@@ -23,7 +23,11 @@ def split_jepa_state_dict(full_sd: Dict[str, torch.Tensor]) -> Dict[str, Dict[st
     backbone: Dict[str, torch.Tensor] = {}
     aux: Dict[str, torch.Tensor] = {}
     for k, v in full_sd.items():
-        if k.startswith("embedding.") or k.startswith("encoder."):
+        if (
+            k.startswith("embedding.")
+            or k.startswith("encoder.")
+            or k == "cls_token"
+        ):
             backbone[k] = v
         else:
             aux[k] = v
@@ -74,7 +78,10 @@ def load_jepa_backbone_state_dict(checkpoint_path: str) -> Dict[str, torch.Tenso
         obj = obj["model_state"]
     if not isinstance(obj, dict):
         raise ValueError(f"Expected a state dict or checkpoint at {checkpoint_path!r}")
-    if obj and all(k.startswith("embedding.") or k.startswith("encoder.") for k in obj):
+    if obj and all(
+        k.startswith("embedding.") or k.startswith("encoder.") or k == "cls_token"
+        for k in obj
+    ):
         return obj
     return split_jepa_state_dict(obj)["backbone"]
 

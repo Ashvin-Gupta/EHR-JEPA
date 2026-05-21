@@ -14,6 +14,7 @@ from training.checkpoint_utils import (
     merge_jepa_split_state_dict,
     save_jepa_split_checkpoints,
     split_bert_trainer_state_dict,
+    split_jepa_state_dict,
 )
 
 
@@ -21,6 +22,7 @@ def test_split_jepa_partitions_all_keys():
     fake_sd = {
         "embedding.weight": torch.zeros(3),
         "encoder.layer.foo": torch.ones(2),
+        "cls_token": torch.randn(8),
         "context_pooler.latent_tokens": torch.randn(4),
         "mask_token": torch.randn(5),
     }
@@ -45,6 +47,16 @@ def test_save_jepa_split_roundtrip_files():
         assert set(bb.keys()) == {"embedding.w", "encoder.w"}
         assert set(aux.keys()) == {"predictor.w"}
 
+    fake_with_cls = {
+        "embedding.w": torch.tensor(1.0),
+        "encoder.w": torch.tensor(2.0),
+        "cls_token": torch.tensor(3.0),
+        "predictor.w": torch.tensor(4.0),
+    }
+    parts = split_jepa_state_dict(fake_with_cls)
+    assert "cls_token" in parts["backbone"]
+    assert "predictor.w" in parts["jepa_aux"]
+
 
 def test_load_jepa_backbone_from_nested_checkpoint():
     full = {
@@ -61,6 +73,22 @@ def test_load_jepa_backbone_from_nested_checkpoint():
         assert set(bb.keys()) == {"embedding.a", "encoder.b"}
     finally:
         os.unlink(path)
+
+    full_cls = {
+        "embedding.a": torch.tensor(7.0),
+        "encoder.b": torch.tensor(8.0),
+        "cls_token": torch.tensor(9.0),
+        "other": torch.tensor(10.0),
+    }
+    ckpt2 = {"model_state": full_cls, "epoch": 1}
+    with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f2:
+        path2 = f2.name
+        torch.save(ckpt2, path2)
+    try:
+        bb2 = load_jepa_backbone_state_dict(path2)
+        assert set(bb2.keys()) == {"embedding.a", "encoder.b", "cls_token"}
+    finally:
+        os.unlink(path2)
 
 
 def test_bert_split_and_strip_prefix():

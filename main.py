@@ -70,6 +70,8 @@ from data.meds_dataset import MEDSDataset
 from data.normalizer import ValueNormalizer
 from data.vocab import build_vocab, Vocab
 from loss.covariance_reg import SIGRegLoss
+from masking.causal_future_masking import CausalFutureMasker
+from masking.causal_single_cut_masking import CausalSingleCutMasker
 from masking.span_masking import SpanMasker
 from models.event_embedding import EmbeddingConfig, EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
@@ -164,6 +166,7 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
     p   = cfg.get("predictor", {})
     lc  = cfg.get("loss", {})
     mk  = cfg.get("masking", {})
+    mask_strategy = mk.get("strategy", "span_budget")
     tr  = cfg.get("training", {})
 
     d_model:       int  = m["d_model"]
@@ -200,13 +203,44 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
 
     prompt   = TemporalSpanPrompt(d_model)
     cov_loss = SIGRegLoss(num_slices=lc.get("sigreg_num_slices", 32))
-    masker   = SpanMasker(
-        mask_ratio=mk.get("mask_ratio", 0.30),
-        default_num_spans=mk.get("default_num_spans", 4),
-        min_span_length=mk.get("min_span_length", 15),
-        min_gap_events=mk.get("min_gap_events", 0),
-        allow_overlap=mk.get("allow_overlap", False),
-    )
+    if mask_strategy == "causal_future":
+        min_tgt_ev = int(
+            mk.get(
+                "min_target_events",
+                p.get("min_span_for_perceiver", mk.get("min_span_length", 15)),
+            )
+        )
+        max_rs = int(mk.get("max_cutpoint_resamples", 64))
+        masker: SpanMasker | CausalFutureMasker | CausalSingleCutMasker = CausalFutureMasker(
+            num_cutpoints_S=mk.get("num_cutpoints_S", 4),
+            future_max_events=mk.get("future_max_events", 64),
+            future_max_hours=float(mk.get("future_max_hours", 12.0)),
+            context_chunk_mode=mk.get("context_chunk_mode", "full_prefix"),
+            min_target_events=min_tgt_ev,
+            max_cutpoint_resamples=max_rs,
+        )
+    elif mask_strategy == "causal_single":
+        min_tgt_ev = int(
+            mk.get(
+                "min_target_events",
+                p.get("min_span_for_perceiver", mk.get("min_span_length", 15)),
+            )
+        )
+        masker = CausalSingleCutMasker(
+            future_max_events=mk.get("future_max_events", 128),
+            future_max_hours=float(mk.get("future_max_hours", 6.0)),
+            min_context_events=int(mk.get("min_context_events", 15)),
+            min_target_events=min_tgt_ev,
+            max_cutpoint_resamples=int(mk.get("max_cutpoint_resamples", 12)),
+        )
+    else:
+        masker = SpanMasker(
+            mask_ratio=mk.get("mask_ratio", 0.30),
+            default_num_spans=mk.get("default_num_spans", 4),
+            min_span_length=mk.get("min_span_length", 15),
+            min_gap_events=mk.get("min_gap_events", 0),
+            allow_overlap=mk.get("allow_overlap", False),
+        )
 
     # Branch A: Perceiver poolers + latent predictor
     context_pooler: LatentCrossAttentionPool | None = None
@@ -238,6 +272,18 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
         min_span_for_perceiver=p.get("min_span_for_perceiver", 15),
         use_proj_head=use_proj_head,
         lambda_cov=lc.get("lambda_cov", 0.1),
+        future_time_decay_lambda=float(lc.get("future_time_decay_lambda", 0.0)),
+        future_time_decay_weight_floor=float(lc.get("future_time_decay_weight_floor", 0.05)),
+        min_target_events=int(
+            mk.get(
+                "min_target_events",
+                p.get("min_span_for_perceiver", mk.get("min_span_length", 10)),
+            )
+        ),
+        causal_single_predictor_attn=str(
+            p.get("causal_single_attn", "bidirectional")
+        ).lower(),
+        masking_strategy=mask_strategy,
         lr=tr.get("lr", 1e-4),
         weight_decay=tr.get("weight_decay", 1e-2),
         grad_clip=tr.get("grad_clip", 1.0),
@@ -284,6 +330,7 @@ def build_loaders(
     task: str               = tr.get("task", "pretrain")
     cache_dir: str | None   = data_cfg.get("cache_dir", None)
     num_workers: int        = tr.get("num_workers", 4)
+    prefetch_factor: int    = int(tr.get("prefetch_factor", 2))
     pin_memory: bool        = bool(tr.get("pin_memory", True)) and torch.cuda.is_available()
 
     if vocab is None:
@@ -308,14 +355,41 @@ def build_loaders(
     # Build the span masker and hand it to the collator so masking runs inside
     # the DataLoader worker processes (parallel to GPU computation).
     # Only used for pretrain; prediction tasks don't need masking in the loader.
-    collator_masker: SpanMasker | None = None
+    collator_masker: SpanMasker | CausalFutureMasker | CausalSingleCutMasker | None = None
     if task == "pretrain":
         mask_cfg = cfg.get("masking", {})
-        collator_masker = SpanMasker(
-            mask_ratio=mask_cfg.get("mask_ratio", 0.30),
-            default_num_spans=mask_cfg.get("default_num_spans", 4),
-            min_span_length=mask_cfg.get("min_span_length", 15),
+        strat = mask_cfg.get("strategy", "span_budget")
+        p_cfg = cfg.get("predictor", {})
+        min_tgt_ev = int(
+            mask_cfg.get(
+                "min_target_events",
+                p_cfg.get("min_span_for_perceiver", mask_cfg.get("min_span_length", 15)),
+            )
         )
+        if strat == "causal_future":
+            max_rs = int(mask_cfg.get("max_cutpoint_resamples", 64))
+            collator_masker = CausalFutureMasker(
+                num_cutpoints_S=mask_cfg.get("num_cutpoints_S", 4),
+                future_max_events=mask_cfg.get("future_max_events", 64),
+                future_max_hours=float(mask_cfg.get("future_max_hours", 12.0)),
+                context_chunk_mode=mask_cfg.get("context_chunk_mode", "full_prefix"),
+                min_target_events=min_tgt_ev,
+                max_cutpoint_resamples=max_rs,
+            )
+        elif strat == "causal_single":
+            collator_masker = CausalSingleCutMasker(
+                future_max_events=mask_cfg.get("future_max_events", 128),
+                future_max_hours=float(mask_cfg.get("future_max_hours", 6.0)),
+                min_context_events=int(mask_cfg.get("min_context_events", 15)),
+                min_target_events=min_tgt_ev,
+                max_cutpoint_resamples=int(mask_cfg.get("max_cutpoint_resamples", 12)),
+            )
+        else:
+            collator_masker = SpanMasker(
+                mask_ratio=mask_cfg.get("mask_ratio", 0.30),
+                default_num_spans=mask_cfg.get("default_num_spans", 4),
+                min_span_length=mask_cfg.get("min_span_length", 15),
+            )
 
     collator = MEDSCollator(
         pad_idx=vocab.unk_idx,
@@ -339,10 +413,15 @@ def build_loaders(
         num_workers=num_workers,
         pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
-        prefetch_factor=2 if num_workers > 0 else None,
+        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
     masking_loc = "worker (fast)" if collator_masker is not None else "main thread"
-    print(f"[data] num_workers={num_workers}  pin_memory={pin_memory}  masking={masking_loc}")
+    mstr = cfg.get("masking", {}).get("strategy", "span_budget") if task == "pretrain" else "n/a"
+    pf = prefetch_factor if num_workers > 0 else 0
+    print(
+        f"[data] num_workers={num_workers}  prefetch={pf}  "
+        f"pin_memory={pin_memory}  masking={masking_loc}  strategy={mstr}"
+    )
 
     # With DDP, shuffle is handled by DistributedSampler (which must not be
     # combined with shuffle=True on the DataLoader itself).
@@ -656,10 +735,12 @@ def _run_final_probe_test(
         encoder = FrozenBERTEncoder(trainer.model).to(device)
     else:
         from evaluation.linear_probe import FrozenEHREncoder
+        pooler = trainer.context_pooler
         encoder = FrozenEHREncoder(
             embedding=trainer.embedding,
             encoder=trainer.encoder,
-            pooler=trainer.context_pooler,
+            pooler=pooler,
+            cls_token=None if pooler is not None else trainer.cls_token,
         ).to(device)
 
     probe = LinearProbe(

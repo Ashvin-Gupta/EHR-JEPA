@@ -10,7 +10,7 @@ data:
   lookup_dir: "/home/ag619/MIMIC_data/hosp"
   vocab_path: "/home/ag619/EHR-JEPA-Data/vocab.json"
   labels_base_dir: "/home/ag619/EHR-JEPA-Data/labels"
-  labels_task: "icu_mortality"
+  labels_task: "hospital_readmission"
   cache_dir: "/home/ag619/EHR-JEPA-Data/cache"
 
 wandb:
@@ -32,7 +32,7 @@ model:
   use_time: true
 
 transformer:
-  n_layers: 6
+  n_layers: 12
   n_heads: 8
   ffn_dim: 256
   dropout: 0.1
@@ -48,10 +48,10 @@ mlm:
 
 training:
   task: "pretrain"
-  max_seq_len: 512
+  max_seq_len: 1024
   # Per-GPU batch size — kept small to avoid OOM at d_model=768 / seq_len=512.
   # With 4 GPUs and gradient_accumulation_steps=6, effective batch ≈ 96*4=384.
-  batch_size: 64
+  batch_size: 128
   gradient_accumulation_steps: 4
   num_workers: 8
   pin_memory: true
@@ -92,12 +92,22 @@ downstream:
 downstream_eval:
   mode: bert
   head_type: linear
-  head_dropout: 0.1
+  head_dropout: 0.2
   run_fraction_sweep: false
   train_fractions: [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
   val_max_files: 5
-  n_epochs: 10
+  n_epochs: 20
   lr: 1.0e-4
-  weight_decay: 0.01
-  batch_size: 32
+  weight_decay: 0.05
+  batch_size: 64
+  early_stopping_patience: 3
+  grad_clip: 1.0
+  label_smoothing: 0
+  freeze_backbone: false
+  backbone_lr_scale: 0.1
+  lr_scheduler: true
+  lr_scheduler_patience: 2
+  lr_scheduler_factor: 0.5
+  wandb_log_train_every: 1
+  val_eval_every: 0
   checkpoint_path: null

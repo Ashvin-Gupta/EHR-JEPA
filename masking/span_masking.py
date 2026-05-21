@@ -40,6 +40,11 @@ class SpanMaskResult:
     context_indices: List[int]
     target_spans: List[List[int]]
     span_times: List[Tuple[float, float]]  # (midpoint_hours, duration_hours)
+    # causal_single only: minutes since cut t, aligned with each target_spans[i]
+    target_token_delta_minutes: Optional[List[List[float]]] = None
+    # causal_single only: active region [context_start .. last_real], split at cutpoint
+    context_start_index: Optional[int] = None
+    cutpoint_index: Optional[int] = None
 
 
 class SpanMasker:

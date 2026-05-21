@@ -34,3 +34,65 @@ def jepa_prediction_loss(
     Scalar loss tensor (gradient flows only through z_pred).
     """
     return F.mse_loss(z_pred, z_target.detach())
+
+
+def jepa_prediction_loss_weighted(
+    z_pred: torch.Tensor,
+    z_target: torch.Tensor,
+    weights: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Token-level weighted MSE for Branch B (and similar rank-3 tensors).
+
+    Parameters
+    ----------
+    z_pred, z_target:
+        FloatTensor (B, N, d).  Stop-gradient applied to z_target.
+    weights:
+        FloatTensor (B, N) — non-negative; zero masks padded span positions.
+        Typical: W_j = exp(-lambda * delta_minutes_j) for causal_single targets.
+
+    Returns
+    -------
+    Scalar: sum(weights * per-token MSE) / sum(weights).
+    """
+    tgt = z_target.detach()
+    per_token = ((z_pred - tgt) ** 2).mean(dim=-1)  # (B, N)
+    w = weights.to(device=z_pred.device, dtype=z_pred.dtype)
+    if w.shape != per_token.shape:
+        raise ValueError(
+            f"weights shape {w.shape} must match per-token MSE {per_token.shape}"
+        )
+    num = (w * per_token).sum()
+    den = w.sum().clamp(min=eps)
+    return num / den
+
+
+def jepa_prediction_loss_token_masked(
+    z_pred: torch.Tensor,
+    z_target: torch.Tensor,
+    token_mask: torch.Tensor,
+    weights: torch.Tensor | None = None,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """
+    Token-level MSE averaged only over positions where ``token_mask == 1``.
+
+    Parameters
+    ----------
+    z_pred, z_target:
+        (B, N, d).  Stop-gradient on target.
+    token_mask:
+        (B, N) — 1 for real target tokens, 0 for batch padding within N.
+    weights:
+        Optional (B, N) non-negative weights (e.g. time decay); padded positions
+        should be zero.
+    """
+    tgt = z_target.detach()
+    per_token = ((z_pred - tgt) ** 2).mean(dim=-1)
+    m = token_mask.to(device=z_pred.device, dtype=per_token.dtype)
+    if weights is not None:
+        w = weights.to(device=z_pred.device, dtype=per_token.dtype)
+        m = m * w
+    return (per_token * m).sum() / m.sum().clamp(min=eps)

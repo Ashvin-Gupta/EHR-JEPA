@@ -31,6 +31,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
+from models.cls_encoding import encode_cls_from_embeddings
 from models.event_embedding import EventEmbedding
 from models.transformer_encoder import EHRTransformerEncoder
 from models.latent_pooling import LatentCrossAttentionPool
@@ -47,7 +48,7 @@ class FrozenEHREncoder(nn.Module):
     module.
 
     Output shape: [B, n_latents * d_model]  (Perceiver mode)
-              or  [B, d_model]              (mean-pooling fallback when pooler=None)
+              or  [B, d_model]              (CLS or mean-pool when pooler=None)
 
     Parameters
     ----------
@@ -57,8 +58,10 @@ class FrozenEHREncoder(nn.Module):
         Pretrained EHRTransformerEncoder.
     pooler:
         Pretrained LatentCrossAttentionPool (context pooler from JEPA).
-        Pass None to fall back to mean pooling over real tokens — useful
-        when use_perceiver=False (Branch B) or for quick experiments.
+        Required when use_perceiver=True.
+    cls_token:
+        Pretrained [CLS] parameter (Branch B / token JEPA).  When pooler is
+        None and cls_token is set, forward returns the CLS embedding.
     """
 
     def __init__(
@@ -66,28 +69,25 @@ class FrozenEHREncoder(nn.Module):
         embedding: EventEmbedding,
         encoder: EHRTransformerEncoder,
         pooler: Optional[LatentCrossAttentionPool],
+        cls_token: Optional[torch.Tensor] = None,
     ) -> None:
         super().__init__()
         self.embedding = embedding
         self.encoder   = encoder
         self.pooler    = pooler
+        self.cls_token = cls_token
 
         # Do not call requires_grad_(False) here: this wrapper often shares
         # embedding/encoder with the live JEPATrainer.  Freezing in place would
         # break pretraining after an inline probe.  @torch.no_grad on forward
         # is sufficient for probe-only evaluation.
 
-        # Compute once at init as a plain int stored in __dict__.
-        # Avoids the silent-failure pattern where an AttributeError inside a
-        # @property on nn.Module gets re-routed to __getattr__ and looks like
-        # the property itself doesn't exist.
         d_model = encoder.config.d_model
         if pooler is not None:
-            # latent_tokens is the nn.Parameter holding the learned queries
             n_latents = pooler.latent_tokens.shape[0]
             self.output_dim: int = n_latents * d_model
         else:
-            self.output_dim = d_model   # mean-pool fallback
+            self.output_dim = d_model
 
     @torch.no_grad()
     def forward(
@@ -122,15 +122,15 @@ class FrozenEHREncoder(nn.Module):
         h = self.encoder(x, attention_mask=attention_mask)  # (B, L, d_model)
 
         if self.pooler is not None:
-            # Perceiver latent pooling → fixed-size representation
-            # LatentCrossAttentionPool expects key_padding_mask (True=ignore)
             pad_mask = attention_mask == 0
-            z = self.pooler(h, key_padding_mask=pad_mask)  # (B, n_latents, d_model)
-            return z.flatten(1)                             # (B, n_latents * d_model)
-        else:
-            # Mean pooling fallback over real tokens
-            real = attention_mask.unsqueeze(-1).float()     # (B, L, 1)
-            return (h * real).sum(1) / real.sum(1).clamp(min=1)  # (B, d_model)
+            z = self.pooler(h, key_padding_mask=pad_mask)
+            return z.flatten(1)
+        if self.cls_token is not None:
+            return encode_cls_from_embeddings(
+                self.encoder, self.cls_token, h, attention_mask
+            )
+        real = attention_mask.unsqueeze(-1).float()
+        return (h * real).sum(1) / real.sum(1).clamp(min=1)
 
 
 # ---------------------------------------------------------------------------
@@ -422,14 +422,12 @@ def load_frozen_encoder_from_checkpoint(
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(ckpt["model_state"])
 
-    if model.context_pooler is None:
-        raise ValueError(
-            "load_frozen_encoder_from_checkpoint requires a Perceiver model "
-            "(use_perceiver=True) — context_pooler must not be None."
-        )
+    pooler = model.context_pooler
+    cls_token = None if pooler is not None else model.cls_token
 
     return FrozenEHREncoder(
         embedding=model.embedding,
         encoder=model.encoder,
-        pooler=model.context_pooler,
+        pooler=pooler,
+        cls_token=cls_token,
     )

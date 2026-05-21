@@ -54,7 +54,8 @@ class SIGRegLoss(nn.Module):
         N_local = x.shape[0]
 
         if N_local <= 1:
-            return x.new_zeros(())
+            # Keep a grad edge to the target tensor (trainer may stack cov terms).
+            return (x.sum() * 0.0) if x.numel() > 0 else x.new_zeros((), requires_grad=True)
 
         dev = x.device
         dtype = x.dtype

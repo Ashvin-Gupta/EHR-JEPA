@@ -25,7 +25,7 @@ data:
   # holding three parquet files:
   # Change labels_task to switch between tasks without editing paths.
   labels_base_dir: "/home/ag619/EHR-JEPA-Data/labels"
-  labels_task: "icu_mortality"   # e.g. icu_mortality | hospital_mortality
+  labels_task: "icu_mortality"   # e.g. icu_mortality | hospital_mortality | hospital_readmission
 
   # Directory for pickle caches of parsed subject sequences.
   # On first run, parquet files are read and the result is saved here.
@@ -77,6 +77,10 @@ model:
   use_time: true
 
 masking:
+  # span_budget — random span mask (shared context, multiple targets).
+  # causal_single — random context_start s + cut t in [s, end]; context [s,t], target (t,end].
+  # causal_future — S independent prefix/future pairs; 1 + S encoder passes.
+  strategy: causal_single
   mask_ratio: 0.30
   default_num_spans: 4
   min_span_length: 15
@@ -85,9 +89,19 @@ masking:
   # If true, target spans may overlap (i-JEPA-style).
   # If false, spans are disjoint and cover exactly the mask budget.
   allow_overlap: false
+  # --- causal_single (defaults) / shared causal_* keys ---
+  future_max_events: 128      # used by causal_future only (ignored for causal_single)
+  future_max_hours: 6.0       # used by causal_future only (ignored for causal_single)
+  min_context_events: 10      # min tokens in [context_start, cut t]
+  min_target_events: 10       # min future-window events; resample t until met
+  max_cutpoint_resamples: 12
+  # --- causal_future only ---
+  num_cutpoints_S: 4
+  # full_prefix | capped_64_or_12h (same cap as target, backward from t_s)
+  context_chunk_mode: full_prefix
 
 transformer:
-  n_layers: 12
+  n_layers: 6
   n_heads: 8
   ffn_dim: 1024
   dropout: 0.1
@@ -99,10 +113,15 @@ predictor:
   n_heads: 8
   # Branch selection:
   #   true  — Perceiver-JEPA: cross-attention pooling to fixed latents, latent predictor
-  #   false — Token I-JEPA:   MASK tokens concat with context, token predictor
-  use_perceiver: true
+  #   false — Token I-JEPA: full-length MASK-at-target predictor; downstream uses CLS
+  use_perceiver: false
   # Branch A only: skip target spans shorter than this many tokens
   min_span_for_perceiver: 15
+  # causal_single + Branch B (token_predictor on [CLS | context_enc | MASK@targets]):
+  #   bidirectional — full self-attention among real tokens (default)
+  #   quadrant — CLS/context cannot attend to MASK slots; MASK→CLS+context allowed;
+  #              context↔context full; target↔target diagonal only
+  causal_single_attn: quadrant
   # Add a Linear + BatchNorm1d projection head after the target perceiver and
   # predictor outputs.  Breaks the LN unit-sphere constraint and gives the
   # anti-collapse objective (CovReg) a free representation space.  Recommended.
@@ -112,8 +131,16 @@ latent_pooling:
   n_latents: 16
 
 loss:
-  # Convex mix: L_total = (1-lambda_cov)*L_pred + lambda_cov*SIGReg. Typical range [0, 1].
-  lambda_cov: 100
+  # L_total = L_pred + lambda_cov * SIGReg(Z_tgt).  SIGReg is typically O(1);
+  # lambda_cov >> 1 (e.g. 100) with grad_clip disabled often blows up weights → NaN.
+  # Safer starting range: 0.05–1.0; enable training.grad_clip (e.g. 1.0) if unstable.
+  lambda_cov: 22
+  # Branch B + masking.strategy causal_single: per-target-token
+  #   W = max(floor, exp(-future_time_decay_lambda * delta_minutes_since_cut))
+  # delta_minutes = wall-clock minutes from cut t to each future event.
+  # 0 = plain unweighted MSE.  Typical lambda: 0.01–0.1 (1/min).
+  future_time_decay_lambda: 0.002888
+  future_time_decay_weight_floor: 0.05
   # SIGReg: number of random 1D projections per forward (no linear proj dim).
   sigreg_num_slices: 32
 
@@ -130,8 +157,10 @@ training:
   # DataLoader parallelism.
   # num_workers > 0 runs __getitem__ in parallel worker processes so the GPU
   # never idles waiting for the next batch.  Set to 0 to disable (useful for
-  # debugging).  4–8 is a good starting point for most clusters.
-  num_workers: 8
+  # debugging).  4–8 per GPU is a good starting point on most clusters.
+  num_workers: 12
+  # Each worker pre-fetches this many batches (requires num_workers > 0).
+  prefetch_factor: 4
 
   # Allocate batch tensors in page-locked (pinned) host memory for faster
   # CPU→GPU DMA transfers.  Automatically disabled when running on CPU-only.
@@ -166,7 +195,7 @@ training:
 
   # Directory where best.pt and last.pt checkpoints are written.
   # Set to "" or omit to disable checkpointing.
-  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/Wed14thMay2/checkpoints"
+  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/Thur21stMaycausal_single/checkpoints"
 
 # ---------------------------------------------------------------------------
 # Inline downstream evaluation
@@ -175,11 +204,11 @@ training:
 # ---------------------------------------------------------------------------
 downstream:
   # Set to true to enable.  Requires data.labels_base_dir and data.labels_task.
-  enabled: true
+  enabled: false
 
   # When false, skip inline linear probe during pretrain even if loaders exist
   # (pretrain-only; final probe test still runs if loaders are built).
-  inline_probe_during_pretrain: true
+  inline_probe_during_pretrain: false
 
   # Number of epochs to train the linear probe each time it runs.
   probe_epochs: 6
@@ -210,7 +239,7 @@ downstream:
 # the same script; only this block changes (especially run_fraction_sweep).
 downstream_eval:
   # Which encoder setup to fine-tune:
-  #   jepa   — Perceiver classifier; load embedding+encoder from checkpoint_path or --checkpoint
+  #   jepa   — JEPA checkpoint: perceiver head if predictor.use_perceiver, else CLS head
   #   scratch — Same architecture as jepa but random init (no checkpoint)
   #   bert   — MLM BERT encoder + CLS head; checkpoint_path required
   mode: jepa
@@ -219,21 +248,41 @@ downstream_eval:
   #   linear — Dropout → Linear(d_total → 1)
   #   mlp    — Dropout → Linear → GELU → Dropout → Linear → 1
   head_type: linear
-  head_dropout: 0.1
+  head_dropout: 0.2          # higher dropout on classification head
 
   # When false: one run using all training subjects (full probe train split).
   # When true: one run per value in train_fractions (subset of train only; val/test unchanged).
-  run_fraction_sweep: false
+  run_fraction_sweep: true
 
   # Used only when run_fraction_sweep is true (each fraction is ceil(f * N_train)).
   train_fractions: [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
 
   # Tuning val loader: cap number of source parquet files (full held-out test always).
   val_max_files: 5
-  n_epochs: 10
+  n_epochs: 20
   lr: 1.0e-4
-  weight_decay: 0.01
+  weight_decay: 0.05         # AdamW L2 — helps when train AUROC >> val AUROC
   batch_size: 96
+
+  # --- Anti-overfitting (supervised finetune) ---
+  # Stop if val AUROC does not improve for this many epochs (0 = run all n_epochs).
+  early_stopping_patience: 5
+  grad_clip: 1.0             # 0 = disabled
+  label_smoothing: 0      # 0 = disabled; softens hard 0/1 labels
+  # true: train pooler + head only; freeze pretrained embedding + encoder
+  freeze_backbone: false
+  # When freeze_backbone is false, backbone still uses lr * this scale (discriminative LR)
+  backbone_lr_scale: 0.1
+  lr_scheduler: true         # ReduceLROnPlateau on val AUROC
+  lr_scheduler_patience: 2
+  lr_scheduler_factor: 0.5
+
+  # W&B logging: train loss every N optimizer steps (1 = every batch; 50 = less noisy).
+  wandb_log_train_every: 1
+  # Val eval every N steps; 0 = end of epoch only (recommended — val is a full pass).
+  val_eval_every: 0
+
+  # Test evaluation uses weights from the epoch with highest val AUROC (not the last epoch).
 
   # Optional default checkpoint for supervised jobs (same as CLI --checkpoint).
   # CLI still wins if you pass --checkpoint explicitly.

@@ -53,6 +53,10 @@ def _build_trainer(
     n_latents: int = N_LATENTS,
     lambda_cov: float = 0.1,
     min_span_for_perceiver: int = 5,
+    masking_strategy: str = "span_budget",
+    future_time_decay_lambda: float = 0.0,
+    min_target_events: int = 10,
+    causal_single_predictor_attn: str = "bidirectional",
 ) -> JEPATrainer:
     embedding = EventEmbedding(EmbeddingConfig(
         embedding_type="learned",
@@ -86,6 +90,10 @@ def _build_trainer(
         use_perceiver=use_perceiver,
         min_span_for_perceiver=min_span_for_perceiver,
         lambda_cov=lambda_cov,
+        masking_strategy=masking_strategy,
+        future_time_decay_lambda=future_time_decay_lambda,
+        min_target_events=min_target_events,
+        causal_single_predictor_attn=causal_single_predictor_attn,
         device="cpu",
         early_stopping_patience=0,
     )
@@ -257,17 +265,20 @@ def test_branch_b_gradient_flow():
     enc_grad        = trainer.encoder.layers[0].self_attn.q_proj.weight.grad
     tok_pred_grad   = trainer.token_predictor.layers[0].self_attn.q_proj.weight.grad
     mask_token_grad = trainer.mask_token.grad
+    cls_token_grad  = trainer.cls_token.grad
 
     print(f"\n[test_branch_b_gradient_flow]")
     print(f"  embedding grad norm:        {emb_grad.norm():.6f}")
     print(f"  encoder grad norm:          {enc_grad.norm():.6f}")
     print(f"  token_predictor grad norm:  {tok_pred_grad.norm():.6f}")
     print(f"  mask_token grad norm:       {mask_token_grad.norm():.6f}")
+    print(f"  cls_token grad norm:        {cls_token_grad.norm():.6f}")
 
     assert emb_grad        is not None and emb_grad.norm()        > 0
     assert enc_grad        is not None and enc_grad.norm()        > 0
     assert tok_pred_grad   is not None and tok_pred_grad.norm()   > 0
     assert mask_token_grad is not None and mask_token_grad.norm() > 0
+    assert cls_token_grad  is not None and cls_token_grad.norm()  > 0
 
 
 # ==================================================================
@@ -310,6 +321,224 @@ def test_short_sequence():
         assert not torch.isnan(l_total)
 
 
+def test_causal_single_token_compact_forward_finite():
+    """causal_single + Branch B: compact predictor path stays finite (no sparse L NaN)."""
+    trainer = _build_trainer(
+        use_perceiver=False,
+        use_value=True,
+        use_time=True,
+        masking_strategy="causal_single",
+        future_time_decay_lambda=0.002888,
+        min_span_for_perceiver=10,
+    )
+    L = 128
+    B = 8
+    codes = torch.randint(0, VOCAB, (B, L))
+    attn = torch.ones(B, L, dtype=torch.long)
+    pre = {"mask_context_indices": [], "mask_target_spans": [], "mask_span_times": []}
+    delta_batch = []
+    for b in range(B):
+        cut = 20 + b
+        ctx = list(range(0, cut + 1))
+        tgt = list(range(cut + 1, cut + 35))
+        delta_min = [float((p - cut) * 60.0) for p in tgt]
+        pre["mask_context_indices"].append(ctx)
+        pre["mask_target_spans"].append([tgt])
+        pre["mask_span_times"].append([(3.0, 4.0)])
+        delta_batch.append([delta_min])
+    pre["mask_target_delta_minutes"] = delta_batch
+    values = torch.rand(B, L)
+    z_scores = torch.rand(B, L)
+    delta_times = torch.rand(B, L)
+    value_mask = torch.ones(B, L, dtype=torch.long)
+    l_pred, l_cov, l_total = trainer(
+        codes, attn, values, z_scores, delta_times, value_mask, pre_mask=pre
+    )
+    assert torch.isfinite(l_pred), f"l_pred={l_pred.item()}"
+    assert torch.isfinite(l_cov), f"l_cov={l_cov.item()}"
+    assert torch.isfinite(l_total)
+    assert l_total.requires_grad
+
+
+def test_causal_single_empty_target_row_still_finite():
+    """One invalid row (empty target) must not NaN the whole batch."""
+    trainer = _build_trainer(
+        use_perceiver=False,
+        masking_strategy="causal_single",
+        future_time_decay_lambda=0.05,
+        min_span_for_perceiver=10,
+    )
+    L = 64
+    codes = torch.randint(0, VOCAB, (3, L))
+    attn = torch.ones(3, L, dtype=torch.long)
+    cut = 15
+    ctx = list(range(0, cut + 1))
+    tgt = list(range(cut + 1, cut + 30))
+    pre = {
+        "mask_context_indices": [ctx, [], ctx],
+        "mask_target_spans": [[tgt], [[]], [tgt]],
+        "mask_span_times": [[(1.0, 2.0)], [(0.0, 0.0)], [(1.0, 2.0)]],
+        "mask_target_delta_minutes": [
+            [[float((p - cut) * 60.0) for p in tgt]],
+            [[]],
+            [[float((p - cut) * 60.0) for p in tgt]],
+        ],
+    }
+    l_pred, l_cov, l_total = trainer(codes, attn, pre_mask=pre)
+    assert torch.isfinite(l_pred)
+    assert torch.isfinite(l_total)
+
+
+def test_causal_single_time_decay_loss_branch_b():
+    """Branch B + causal_single + delta minutes uses weighted L_pred."""
+    trainer = _build_trainer(
+        use_perceiver=False,
+        min_span_for_perceiver=5,
+        masking_strategy="causal_single",
+        future_time_decay_lambda=0.1,
+    )
+    L = 48
+    codes = torch.randint(0, VOCAB, (2, L))
+    attn = torch.ones(2, L, dtype=torch.long)
+    cut = 12
+    ctx = list(range(0, cut + 1))
+    tgt = list(range(cut + 1, cut + 16))
+    delta_min = [float((p - cut) * 60.0) for p in tgt]
+    pre = {
+        "mask_context_indices": [ctx, ctx],
+        "mask_target_spans": [[tgt], [tgt]],
+        "mask_span_times": [[(2.0, 3.0)], [(2.0, 3.0)]],
+        "mask_target_delta_minutes": [[delta_min], [delta_min]],
+    }
+    l_pred, l_cov, l_total = trainer(codes, attn, pre_mask=pre)
+    assert torch.isfinite(l_total) and l_total.requires_grad
+    assert l_pred.item() >= 0.0
+
+
+def test_causal_single_span_pre_mask_forward():
+    """causal_single collator keys (span path): one prefix/future pair per row."""
+    trainer = _build_trainer(use_perceiver=True, min_span_for_perceiver=5)
+    L = 48
+    codes = torch.randint(0, VOCAB, (2, L))
+    attn = torch.ones(2, L, dtype=torch.long)
+    ctx_indices: list = []
+    tgt_spans: list = []
+    span_times: list = []
+    for cut in (12, 14):
+        ctx = list(range(0, cut + 1))
+        tgt = list(range(cut + 1, min(cut + 1 + 16, L)))
+        ctx_indices.append(ctx)
+        tgt_spans.append([tgt])
+        span_times.append([(2.0, 3.0)])
+    pre = {
+        "mask_context_indices": ctx_indices,
+        "mask_target_spans": tgt_spans,
+        "mask_span_times": span_times,
+    }
+    l_pred, l_cov, l_total = trainer(codes, attn, pre_mask=pre)
+    assert l_pred.ndim == 0 and torch.isfinite(l_total)
+    assert l_total.requires_grad
+    assert l_total.item() >= 0.0
+
+
+def test_causal_multi_cut_pre_mask_forward():
+    """Causal collator-style pre_mask: S context/target pairs, mean loss over s."""
+    trainer = _build_trainer(use_perceiver=True, min_span_for_perceiver=5)
+    L = 48
+    S = 3
+    codes = torch.randint(0, VOCAB, (2, L))
+    attn = torch.ones(2, L, dtype=torch.long)
+    cc: list = []
+    tt: list = []
+    st: list = []
+    for _b in range(2):
+        cc_b, tt_b, st_b = [], [], []
+        for s in range(S):
+            cut = 8 + s * 6
+            ctx = list(range(0, cut + 1))
+            tgt = list(range(cut + 1, min(cut + 1 + 12, L)))
+            cc_b.append(ctx)
+            tt_b.append(tgt)
+            st_b.append((float(s) + 0.5, 2.0))
+        cc.append(cc_b)
+        tt.append(tt_b)
+        st.append(st_b)
+    pre = {
+        "mask_causal_contexts": cc,
+        "mask_causal_targets": tt,
+        "mask_causal_span_times": st,
+    }
+    l_pred, l_cov, l_total = trainer(codes, attn, pre_mask=pre)
+    assert l_pred.ndim == 0 and not torch.isnan(l_total)
+    assert l_total.item() >= 0.0
+
+
+def test_causal_all_cuts_skipped_backward_ok():
+    """Every cut invalid — must not crash backward (differentiable zero loss)."""
+    trainer = _build_trainer(use_perceiver=True, min_span_for_perceiver=15)
+    L = 32
+    codes = torch.randint(0, VOCAB, (2, L))
+    attn = torch.ones(2, L, dtype=torch.long)
+    S = 2
+    cc = [[[], []], [[], []]]
+    tt = [[[], []], [[], []]]
+    st = [[(0.0, 0.0), (0.0, 0.0)], [(0.0, 0.0), (0.0, 0.0)]]
+    pre = {"mask_causal_contexts": cc, "mask_causal_targets": tt, "mask_causal_span_times": st}
+    l_pred, l_cov, l_total = trainer(codes, attn, pre_mask=pre)
+    assert l_total.requires_grad
+    l_total.backward()
+    assert l_total.item() == 0.0
+
+
+def test_causal_partial_batch_still_trains_when_one_row_invalid():
+    """One invalid row per cut must not drop the whole cut (batch_size > 2)."""
+    trainer = _build_trainer(use_perceiver=True, min_span_for_perceiver=5)
+    L = 40
+    B = 4
+    codes = torch.randint(0, VOCAB, (B, L))
+    attn = torch.ones(B, L, dtype=torch.long)
+    cc, tt, st = [], [], []
+    for b in range(B):
+        cc_b, tt_b, st_b = [], [], []
+        cut = 10
+        ctx = list(range(0, cut + 1))
+        tgt = list(range(cut + 1, cut + 20))
+        cc_b.append(ctx if b > 0 else [])  # row 0 invalid at s=0
+        tt_b.append(tgt if b > 0 else [])
+        st_b.append((1.0, 2.0) if b > 0 else (0.0, 0.0))
+        cc.append(cc_b)
+        tt.append(tt_b)
+        st.append(st_b)
+    pre = {"mask_causal_contexts": cc, "mask_causal_targets": tt, "mask_causal_span_times": st}
+    l_pred, l_cov, l_total = trainer(codes, attn, pre_mask=pre)
+    assert torch.isfinite(l_total) and l_total.requires_grad
+    assert l_total.item() > 0.0
+
+
+def test_causal_skips_cut_when_any_row_has_empty_context():
+    """Mixed batch: one empty context for cut s — must not produce NaN in l_pred."""
+    trainer = _build_trainer(use_perceiver=True, min_span_for_perceiver=5)
+    L = 40
+    codes = torch.randint(0, VOCAB, (2, L))
+    attn = torch.ones(2, L, dtype=torch.long)
+    # Cut s=0: row 1 has empty context (simulates masker skip); cut s=1: both valid.
+    cc = [
+        [list(range(0, 11)), list(range(0, 8))],
+        [[], list(range(0, 8))],
+    ]
+    tt = [
+        [list(range(11, 22)), list(range(8, 19))],
+        [list(range(12, 22)), list(range(8, 19))],
+    ]
+    st = [
+        [(1.0, 2.0), (2.0, 2.0)],
+        [(1.0, 2.0), (2.0, 2.0)],
+    ]
+    pre = {"mask_causal_contexts": cc, "mask_causal_targets": tt, "mask_causal_span_times": st}
+    l_pred, l_cov, l_total = trainer(codes, attn, pre_mask=pre)
+    assert torch.isfinite(l_pred) and torch.isfinite(l_cov) and torch.isfinite(l_total)
+
+
 def test_shared_encoder_weights():
     """Both pathways use the same nn.Module instance (same id)."""
     trainer = _build_trainer(use_perceiver=True)
@@ -339,6 +568,13 @@ if __name__ == "__main__":
         test_losses_positive_branch_a,
         test_losses_positive_branch_b,
         test_short_sequence,
+        test_causal_single_token_compact_forward_finite,
+        test_causal_single_empty_target_row_still_finite,
+        test_causal_single_time_decay_loss_branch_b,
+        test_causal_single_span_pre_mask_forward,
+        test_causal_multi_cut_pre_mask_forward,
+        test_causal_all_cuts_skipped_backward_ok,
+        test_causal_skips_cut_when_any_row_has_empty_context,
         test_shared_encoder_weights,
     ]
     passed = failed = 0

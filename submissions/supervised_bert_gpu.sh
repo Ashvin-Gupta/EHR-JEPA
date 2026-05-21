@@ -6,7 +6,7 @@
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 #SBATCH --output=/home/ag619/EHR-JEPA/logs/Supervised/%x_%j.log
-#SBATCH --job-name=sup-JEPA
+#SBATCH --job-name=sup-bert
 
 set -e
 
@@ -28,7 +28,7 @@ export PYTHONUNBUFFERED=1
 
 echo "Job ID:   ${SLURM_JOB_ID}"
 echo "Log file: logs/Supervised/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
-python main_supervised_downstream.py --config configs/ehr_config.yaml
+python main_supervised_downstream.py --config configs/bert_config.yaml --checkpoint /home/ag619/EHR-JEPA-Data/bert_checkpoints/best.pt
 
 echo "Supervised finished."
 
