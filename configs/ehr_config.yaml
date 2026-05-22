@@ -80,7 +80,7 @@ masking:
   # span_budget — random span mask (shared context, multiple targets).
   # causal_single — random context_start s + cut t in [s, end]; context [s,t], target (t,end].
   # causal_future — S independent prefix/future pairs; 1 + S encoder passes.
-  strategy: causal_single
+  strategy: span_budget
   mask_ratio: 0.30
   default_num_spans: 4
   min_span_length: 15
@@ -134,7 +134,7 @@ loss:
   # L_total = L_pred + lambda_cov * SIGReg(Z_tgt).  SIGReg is typically O(1);
   # lambda_cov >> 1 (e.g. 100) with grad_clip disabled often blows up weights → NaN.
   # Safer starting range: 0.05–1.0; enable training.grad_clip (e.g. 1.0) if unstable.
-  lambda_cov: 22
+  lambda_cov: 0.68 #masking for 0.1 of pred loss
   # Branch B + masking.strategy causal_single: per-target-token
   #   W = max(floor, exp(-future_time_decay_lambda * delta_minutes_since_cut))
   # delta_minutes = wall-clock minutes from cut t to each future event.
@@ -189,13 +189,19 @@ training:
   # ---- Early stopping ----
   early_stopping_patience: 0   # epochs without improvement before stopping
                                 # set to 0 to disable
+  # Lower-is-better: val_loss, train_loss. Higher-is-better: val_auroc, val_aupr,
+  # accuracy, rank_me, f1 (substring match on metric name).
   early_stopping_metric: "val_loss"   # "val_loss" or "train_loss"
+
+  # RankMe SVD during training (0 = validation epochs only).
+  rank_me_every_n_steps: 50
+  rank_me_train_max_rows: 256
 
   n_epochs: 20
 
   # Directory where best.pt and last.pt checkpoints are written.
   # Set to "" or omit to disable checkpointing.
-  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/Thur21stMaycausal_single/checkpoints"
+  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/Thur21stMayspan_budget/checkpoints"
 
 # ---------------------------------------------------------------------------
 # Inline downstream evaluation
@@ -223,6 +229,11 @@ downstream:
   # since no gradients flow through the frozen encoder).
   probe_batch_size: 64
 
+  # Sequence pooling when encoder has no perceiver (token JEPA / BERT):
+  #   cls       — [CLS] token (default)
+  #   mean_pool — masked mean over event tokens (CLS excluded for BERT)
+  pooling: cls
+
   # Limit the number of source parquet files used for the probe *val* (tuning)
   # DataLoader only.  The probe training loader always uses all files.
   # Reduces inline probe evaluation time on large splits.
@@ -244,6 +255,11 @@ downstream_eval:
   #   bert   — MLM BERT encoder + CLS head; checkpoint_path required
   mode: jepa
 
+  # Sequence pooling for token JEPA / BERT (ignored when predictor.use_perceiver):
+  #   cls       — [CLS] token
+  #   mean_pool — masked mean over event tokens
+  pooling: mean_pool
+
   # Classification head on top of pooled (JEPA) or CLS (BERT) features:
   #   linear — Dropout → Linear(d_total → 1)
   #   mlp    — Dropout → Linear → GELU → Dropout → Linear → 1
@@ -252,7 +268,7 @@ downstream_eval:
 
   # When false: one run using all training subjects (full probe train split).
   # When true: one run per value in train_fractions (subset of train only; val/test unchanged).
-  run_fraction_sweep: true
+  run_fraction_sweep: false
 
   # Used only when run_fraction_sweep is true (each fraction is ceil(f * N_train)).
   train_fractions: [0.01, 0.05, 0.1, 0.2, 0.5, 1.0]
@@ -262,7 +278,7 @@ downstream_eval:
   n_epochs: 20
   lr: 1.0e-4
   weight_decay: 0.05         # AdamW L2 — helps when train AUROC >> val AUROC
-  batch_size: 96
+  batch_size: 1024
 
   # --- Anti-overfitting (supervised finetune) ---
   # Stop if val AUROC does not improve for this many epochs (0 = run all n_epochs).
@@ -270,7 +286,7 @@ downstream_eval:
   grad_clip: 1.0             # 0 = disabled
   label_smoothing: 0      # 0 = disabled; softens hard 0/1 labels
   # true: train pooler + head only; freeze pretrained embedding + encoder
-  freeze_backbone: false
+  freeze_backbone: true
   # When freeze_backbone is false, backbone still uses lr * this scale (discriminative LR)
   backbone_lr_scale: 0.1
   lr_scheduler: true         # ReduceLROnPlateau on val AUROC

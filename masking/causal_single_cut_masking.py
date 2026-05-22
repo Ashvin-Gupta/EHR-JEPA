@@ -94,9 +94,9 @@ class CausalSingleCutMasker:
 
         empty = SpanMaskResult(
             context_indices=[],
-            target_spans=[[]],
-            span_times=[(0.0, 0.0)],
-            target_token_delta_minutes=[[]],
+            target_spans=[],
+            span_times=[],
+            target_token_delta_minutes=[],
         )
 
         if len(reals) < 2:

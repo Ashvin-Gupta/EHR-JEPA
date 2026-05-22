@@ -33,8 +33,12 @@ if ROOT not in sys.path:
 
 from models.cls_encoding import encode_cls_from_embeddings
 from models.event_embedding import EventEmbedding
-from models.transformer_encoder import EHRTransformerEncoder
 from models.latent_pooling import LatentCrossAttentionPool
+from models.sequence_pooling import (
+    SequencePoolingMode,
+    mean_pool_sequence,
+    parse_pooling_mode,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -60,8 +64,10 @@ class FrozenEHREncoder(nn.Module):
         Pretrained LatentCrossAttentionPool (context pooler from JEPA).
         Required when use_perceiver=True.
     cls_token:
-        Pretrained [CLS] parameter (Branch B / token JEPA).  When pooler is
-        None and cls_token is set, forward returns the CLS embedding.
+        Pretrained [CLS] parameter (Branch B / token JEPA).  Required when
+        pooler is None and pooling_mode is ``cls``.
+    pooling_mode:
+        ``cls`` or ``mean_pool``.  Ignored when pooler is set (Perceiver).
     """
 
     def __init__(
@@ -70,12 +76,16 @@ class FrozenEHREncoder(nn.Module):
         encoder: EHRTransformerEncoder,
         pooler: Optional[LatentCrossAttentionPool],
         cls_token: Optional[torch.Tensor] = None,
+        pooling_mode: SequencePoolingMode = "cls",
     ) -> None:
         super().__init__()
         self.embedding = embedding
         self.encoder   = encoder
         self.pooler    = pooler
         self.cls_token = cls_token
+        self.pooling_mode = parse_pooling_mode(pooling_mode)
+        if pooler is None and self.pooling_mode == "cls" and cls_token is None:
+            raise ValueError("cls_token is required when pooling_mode='cls'")
 
         # Do not call requires_grad_(False) here: this wrapper often shares
         # embedding/encoder with the live JEPATrainer.  Freezing in place would
@@ -125,12 +135,11 @@ class FrozenEHREncoder(nn.Module):
             pad_mask = attention_mask == 0
             z = self.pooler(h, key_padding_mask=pad_mask)
             return z.flatten(1)
-        if self.cls_token is not None:
+        if self.pooling_mode == "cls":
             return encode_cls_from_embeddings(
                 self.encoder, self.cls_token, h, attention_mask
             )
-        real = attention_mask.unsqueeze(-1).float()
-        return (h * real).sum(1) / real.sum(1).clamp(min=1)
+        return mean_pool_sequence(h, attention_mask)
 
 
 # ---------------------------------------------------------------------------
@@ -399,9 +408,35 @@ def _au_pr(labels: torch.Tensor, probs: torch.Tensor) -> float:
 # Checkpoint loader
 # ---------------------------------------------------------------------------
 
+def build_frozen_jepa_encoder(
+    embedding: EventEmbedding,
+    encoder: EHRTransformerEncoder,
+    context_pooler: Optional[LatentCrossAttentionPool],
+    cls_token: Optional[torch.Tensor],
+    pooling_mode: SequencePoolingMode = "cls",
+) -> FrozenEHREncoder:
+    """Wrap JEPA components for probing; Perceiver ignores pooling_mode."""
+    if context_pooler is not None:
+        return FrozenEHREncoder(
+            embedding=embedding,
+            encoder=encoder,
+            pooler=context_pooler,
+            pooling_mode="cls",
+        )
+    mode = parse_pooling_mode(pooling_mode)
+    return FrozenEHREncoder(
+        embedding=embedding,
+        encoder=encoder,
+        pooler=None,
+        cls_token=cls_token if mode == "cls" else None,
+        pooling_mode=mode,
+    )
+
+
 def load_frozen_encoder_from_checkpoint(
     checkpoint_path: str,
     model: "JEPATrainer",  # noqa: F821
+    pooling_mode: SequencePoolingMode = "cls",
 ) -> FrozenEHREncoder:
     """
     Load best.pt / last.pt into a JEPATrainer instance and return a
@@ -422,12 +457,10 @@ def load_frozen_encoder_from_checkpoint(
     ckpt = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(ckpt["model_state"])
 
-    pooler = model.context_pooler
-    cls_token = None if pooler is not None else model.cls_token
-
-    return FrozenEHREncoder(
+    return build_frozen_jepa_encoder(
         embedding=model.embedding,
         encoder=model.encoder,
-        pooler=pooler,
-        cls_token=cls_token,
+        context_pooler=model.context_pooler,
+        cls_token=model.cls_token,
+        pooling_mode=pooling_mode,
     )

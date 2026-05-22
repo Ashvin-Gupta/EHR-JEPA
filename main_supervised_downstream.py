@@ -16,6 +16,7 @@ Modes (``downstream_eval.mode`` or ``--mode``):
   jepa    — Perceiver classifier; optional checkpoint loads backbone weights only.
   scratch — Same as jepa without loading pretrained weights.
   bert    — BERT + CLS head; checkpoint required.
+  ar      — Autoregressive + CLS head; checkpoint required.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ if ROOT not in sys.path:
 
 from data.normalizer import ValueNormalizer
 from data.vocab import Vocab
+from evaluation.ar_supervised import ARSupervisedClassifier
 from evaluation.bert_supervised import BERTSupervisedClassifier
 from evaluation.linear_probe import _compute_all_metrics
 from evaluation.supervised_cls import SupervisedCLSClassifier
@@ -56,10 +58,14 @@ from main import (
 )
 from models.event_embedding import EmbeddingConfig, EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
+from models.sequence_pooling import SequencePoolingMode, get_config_pooling
 from models.transformer_encoder import EHRTransformerEncoder, TransformerEncoderConfig
+from training.ar_trainer import AREHRModel
 from training.bert_trainer import BERTEHRModel
 from training.checkpoint_utils import (
+    ar_backbone_state_dict_for_arehrmodel,
     bert_backbone_state_dict_for_bertehrmodel,
+    load_ar_backbone_state_dict,
     load_bert_backbone_state_dict,
     load_jepa_backbone_state_dict,
 )
@@ -83,6 +89,9 @@ def _make_supervised_run_name(cfg: dict, mode: str) -> str:
         parts.append("value")
     if m.get("use_time"):
         parts.append("time")
+    p = cfg.get("predictor", {})
+    if not bool(p.get("use_perceiver", True)) or de.get("mode") in ("bert", "ar"):
+        parts.append(str(de.get("pooling", "cls")))
     return "__".join(parts)
 
 
@@ -136,6 +145,9 @@ def _configure_supervised_freeze(model: nn.Module, freeze_backbone: bool) -> Non
     elif isinstance(model, BERTSupervisedClassifier):
         for p in model.bert.parameters():
             p.requires_grad = False
+    elif isinstance(model, ARSupervisedClassifier):
+        for p in model.ar.parameters():
+            p.requires_grad = False
     else:
         raise TypeError(f"Unknown supervised model type: {type(model)}")
 
@@ -165,10 +177,17 @@ def _build_supervised_optimizer(
         for mod in (model.embedding, model.encoder):
             backbone_params.extend(p for p in mod.parameters() if p.requires_grad)
         head_params.extend(p for p in model.head.parameters() if p.requires_grad)
-        if model.cls_token.requires_grad:
+        if (
+            model.cls_token is not None
+            and model.cls_token.requires_grad
+            and model.pooling_mode == "cls"
+        ):
             head_params.append(model.cls_token)
     elif isinstance(model, BERTSupervisedClassifier):
         backbone_params.extend(p for p in model.bert.parameters() if p.requires_grad)
+        head_params.extend(p for p in model.head.parameters() if p.requires_grad)
+    elif isinstance(model, ARSupervisedClassifier):
+        backbone_params.extend(p for p in model.ar.parameters() if p.requires_grad)
         head_params.extend(p for p in model.head.parameters() if p.requires_grad)
     else:
         return optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
@@ -234,13 +253,17 @@ def _build_jepa_supervised(
             head_dropout=head_dropout,
         )
 
-    cls_token = nn.Parameter(torch.randn(d_model) * 0.02)
+    pooling = get_config_pooling(cfg, "downstream_eval")
+    cls_token = (
+        nn.Parameter(torch.randn(d_model) * 0.02) if pooling == "cls" else None
+    )
     return SupervisedCLSClassifier(
         embedding=embedding,
         encoder=encoder,
         cls_token=cls_token,
         head_type=head_type,  # type: ignore[arg-type]
         head_dropout=head_dropout,
+        pooling_mode=pooling,
     )
 
 
@@ -284,10 +307,12 @@ def _build_bert_supervised(cfg: dict, vocab: Vocab) -> BERTSupervisedClassifier:
     head_dropout = float(de.get("head_dropout", 0.1))
     if head_type not in ("linear", "mlp"):
         raise ValueError("downstream_eval.head_type must be 'linear' or 'mlp'")
+    pooling = get_config_pooling(cfg, "downstream_eval")
     return BERTSupervisedClassifier(
         bert=bert,
         head_type=head_type,  # type: ignore[arg-type]
         head_dropout=head_dropout,
+        pooling_mode=pooling,
     )
 
 
@@ -306,6 +331,61 @@ def _load_bert_backbone(model: BERTSupervisedClassifier, path: str) -> None:
     bb = load_bert_backbone_state_dict(path)
     inner = bert_backbone_state_dict_for_bertehrmodel(bb)
     model.bert.load_state_dict(inner, strict=False)
+
+
+def _build_ar_supervised(cfg: dict, vocab: Vocab) -> ARSupervisedClassifier:
+    m = cfg["model"]
+    t = cfg.get("transformer", {})
+    d_model = int(m["d_model"])
+    use_value = bool(m.get("use_value", False))
+    use_time = bool(m.get("use_time", False))
+    emb_type = m["embedding_type"]
+    n_heads = int(t.get("n_heads", 8))
+
+    embedding = EventEmbedding(
+        EmbeddingConfig(
+            embedding_type=emb_type,
+            vocab_size=vocab.vocab_size,
+            d_model=d_model,
+            code_embeddings_path=m.get("code_embeddings_path"),
+            encoder_hidden_dim=m.get("encoder_hidden_dim", 768),
+            unk_idx=vocab.unk_idx,
+            use_value=use_value,
+            use_time=use_time,
+        )
+    )
+    encoder = EHRTransformerEncoder(
+        TransformerEncoderConfig(
+            n_layers=int(t.get("n_layers", 6)),
+            d_model=d_model,
+            n_heads=n_heads,
+            ffn_dim=int(t.get("ffn_dim", 1024)),
+            dropout=float(t.get("dropout", 0.1)),
+        )
+    )
+    ar = AREHRModel(
+        embedding=embedding,
+        encoder=encoder,
+        vocab_size=vocab.vocab_size,
+    )
+    de = cfg.get("downstream_eval", {})
+    head_type = str(de.get("head_type", "linear"))
+    head_dropout = float(de.get("head_dropout", 0.1))
+    if head_type not in ("linear", "mlp"):
+        raise ValueError("downstream_eval.head_type must be 'linear' or 'mlp'")
+    pooling = get_config_pooling(cfg, "downstream_eval")
+    return ARSupervisedClassifier(
+        ar=ar,
+        head_type=head_type,  # type: ignore[arg-type]
+        head_dropout=head_dropout,
+        pooling_mode=pooling,
+    )
+
+
+def _load_ar_backbone(model: ARSupervisedClassifier, path: str) -> None:
+    bb = load_ar_backbone_state_dict(path)
+    inner = ar_backbone_state_dict_for_arehrmodel(bb)
+    model.ar.load_state_dict(inner, strict=False)
 
 
 def _train_one_run(
@@ -550,9 +630,9 @@ def main() -> None:
     parser.add_argument("--config", default=os.path.join(ROOT, "configs", "ehr_config.yaml"))
     parser.add_argument(
         "--mode",
-        choices=("jepa", "scratch", "bert"),
+        choices=("jepa", "scratch", "bert", "ar"),
         default=None,
-        help="Override downstream_eval.mode (jepa | scratch | bert)",
+        help="Override downstream_eval.mode (jepa | scratch | bert | ar)",
     )
     parser.add_argument(
         "--checkpoint",
@@ -581,9 +661,9 @@ def main() -> None:
     de = cfg.get("downstream_eval", {})
 
     mode = args.mode or de.get("mode")
-    if mode not in ("jepa", "scratch", "bert"):
+    if mode not in ("jepa", "scratch", "bert", "ar"):
         raise SystemExit(
-            "Set downstream_eval.mode to jepa, scratch, or bert (or pass --mode)."
+            "Set downstream_eval.mode to jepa, scratch, bert, or ar (or pass --mode)."
         )
     mode = str(mode)
 
@@ -654,11 +734,16 @@ def main() -> None:
         model = _build_jepa_supervised(cfg, vocab)
         if mode == "jepa" and ckpt:
             _load_jepa_backbone(model, ckpt)
-    else:
+    elif mode == "bert":
         model = _build_bert_supervised(cfg, vocab)
         if not ckpt:
             raise SystemExit("bert mode requires a checkpoint (downstream_eval.checkpoint_path or --checkpoint)")
         _load_bert_backbone(model, ckpt)
+    else:
+        model = _build_ar_supervised(cfg, vocab)
+        if not ckpt:
+            raise SystemExit("ar mode requires a checkpoint (downstream_eval.checkpoint_path or --checkpoint)")
+        _load_ar_backbone(model, ckpt)
 
     seed_i = int(seed) if seed is not None else 0
 
@@ -673,6 +758,7 @@ def main() -> None:
             "supervised_mode": mode,
             "supervised_checkpoint": ckpt or "",
             "run_fraction_sweep": do_fraction_sweep,
+            "supervised_pooling": get_config_pooling(cfg, "downstream_eval"),
         })
 
     if do_fraction_sweep:
@@ -685,9 +771,12 @@ def main() -> None:
                 m = _build_jepa_supervised(cfg, vocab)
                 if mode == "jepa" and ckpt:
                     _load_jepa_backbone(m, ckpt)
-            else:
+            elif mode == "bert":
                 m = _build_bert_supervised(cfg, vocab)
                 _load_bert_backbone(m, ckpt)
+            else:
+                m = _build_ar_supervised(cfg, vocab)
+                _load_ar_backbone(m, ckpt)
             log_prefix = f"supervised/frac_{frac:g}"
             frac_steps = n_epochs * max(len(train_loader), 1)
             step_offset = frac_i * (frac_steps + 2)

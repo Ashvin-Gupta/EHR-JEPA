@@ -30,6 +30,8 @@ from typing import Optional
 import torch
 import torch.nn as nn
 
+from models.sequence_pooling import SequencePoolingMode, parse_pooling_mode
+
 
 class FrozenBERTEncoder(nn.Module):
     """
@@ -43,9 +45,14 @@ class FrozenBERTEncoder(nn.Module):
         modified and ``requires_grad`` is left unchanged (see module docstring).
     """
 
-    def __init__(self, bert_model: "BERTEHRModel") -> None:  # noqa: F821
+    def __init__(
+        self,
+        bert_model: "BERTEHRModel",  # noqa: F821
+        pooling_mode: SequencePoolingMode = "cls",
+    ) -> None:
         super().__init__()
         self.bert_model = bert_model
+        self.pooling_mode = parse_pooling_mode(pooling_mode)
 
         self.output_dim: int = bert_model.output_dim
 
@@ -68,20 +75,14 @@ class FrozenBERTEncoder(nn.Module):
 
         Returns
         -------
-        FloatTensor (B, d_model) — the [CLS] token embedding.
+        FloatTensor (B, d_model) — CLS or mean-pooled event embedding.
         """
-        # For downstream evaluation we pass the real codes (no masking).
-        # mlm_labels is all -100 so the MLM loss is zero and irrelevant.
-        B, L = codes.shape
-        dummy_labels = codes.new_full((B, L), -100)
-
-        _, cls_embedding = self.bert_model(
-            input_codes=codes,
-            attention_mask=attention_mask,
-            mlm_labels=dummy_labels,
+        return self.bert_model.encode_pooled_embedding(
+            codes,
+            attention_mask,
             values=values,
             z_scores=z_scores,
             delta_times=delta_times,
             value_mask=value_mask,
+            pooling_mode=self.pooling_mode,
         )
-        return cls_embedding  # (B, d_model)

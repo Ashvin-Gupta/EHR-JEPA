@@ -1,4 +1,4 @@
-"""BERT encoder + configurable head for supervised binary classification."""
+"""AR encoder + configurable head for supervised binary classification."""
 
 from __future__ import annotations
 
@@ -9,25 +9,25 @@ import torch.nn as nn
 
 from evaluation.supervised_perceiver import build_classification_head
 from models.sequence_pooling import SequencePoolingMode, parse_pooling_mode
-from training.bert_trainer import BERTEHRModel
+from training.ar_trainer import AREHRModel
 
 HeadType = Literal["linear", "mlp"]
 
 
-class BERTSupervisedClassifier(nn.Module):
-    """Pooled BERT sequence embedding → linear or MLP → logit (BCEWithLogits)."""
+class ARSupervisedClassifier(nn.Module):
+    """Pooled AR sequence embedding → linear or MLP → logit (BCEWithLogits)."""
 
     def __init__(
         self,
-        bert: BERTEHRModel,
+        ar: AREHRModel,
         head_type: HeadType = "linear",
         head_dropout: float = 0.1,
         pooling_mode: SequencePoolingMode = "cls",
     ) -> None:
         super().__init__()
-        self.bert = bert
+        self.ar = ar
         self.pooling_mode = parse_pooling_mode(pooling_mode)
-        d_model = bert.output_dim
+        d_model = ar.output_dim
         self.head = build_classification_head(
             d_model, d_model, head_type, head_dropout
         )
@@ -41,7 +41,7 @@ class BERTSupervisedClassifier(nn.Module):
         delta_times: Optional[torch.Tensor] = None,
         value_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        pooled = self.bert.encode_pooled_embedding(
+        pooled = self.ar.encode_pooled_embedding(
             codes,
             attention_mask,
             values=values,

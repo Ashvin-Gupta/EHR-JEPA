@@ -63,11 +63,17 @@ def _make_pooler() -> LatentCrossAttentionPool:
     return LatentCrossAttentionPool(d_model=D, n_latents=N_LATENTS, n_heads=4)
 
 
-def _make_frozen_encoder(with_pooler: bool = True) -> FrozenEHREncoder:
+def _make_frozen_encoder(
+    with_pooler: bool = True,
+    pooling_mode: str = "mean_pool",
+) -> FrozenEHREncoder:
+    cls_token = torch.randn(D) * 0.02 if pooling_mode == "cls" else None
     return FrozenEHREncoder(
         embedding=_make_embedding(),
         encoder=_make_encoder(),
         pooler=_make_pooler() if with_pooler else None,
+        cls_token=cls_token,
+        pooling_mode=pooling_mode,  # type: ignore[arg-type]
     )
 
 

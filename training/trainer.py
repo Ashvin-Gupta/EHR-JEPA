@@ -23,7 +23,8 @@ Two predictor branches, controlled by TrainerConfig.use_perceiver:
     Predictor input: full-length (B, L, d) with context encodings at context
     indices and learnable MASK (+ temporal prompt) at target indices.
     Token predictor → (B, L, d); slice target positions → Y_hat.
-    Loss: MSE(Y_hat, Y_tgt.detach()) + λ·CovReg(Y_tgt)
+    Optional ProjectionHead on Y_hat / Y_tgt (when use_proj_head).
+    Loss: MSE(Y_hat_proj, Y_tgt_proj.detach()) + λ·CovReg(Y_tgt_proj)
 
     Downstream (token branch): encoder + pretrained CLS only (no pooler / predictor).
 
@@ -157,6 +158,23 @@ def _zero_loss_connected(t: torch.Tensor) -> torch.Tensor:
     return t.new_zeros((), requires_grad=True)
 
 
+def _early_stopping_higher_is_better(metric_name: str) -> bool:
+    """True when a larger monitor value is better (e.g. AUROC, accuracy)."""
+    name = metric_name.lower()
+    for token in ("auroc", "aupr", "accuracy", "rank_me", "f1", "recall", "precision"):
+        if token in name:
+            return True
+    return False
+
+
+def _early_stopping_improved(
+    monitor: float, best_metric: float, higher_is_better: bool
+) -> bool:
+    if higher_is_better:
+        return monitor > best_metric
+    return monitor < best_metric
+
+
 def _rank_me_from_rows(z_rows: torch.Tensor) -> float:
     """
     Effective rank (RankMe) from embedding rows (n, d).
@@ -224,6 +242,10 @@ class TrainerConfig:
     early_stopping_patience: int = 5
     early_stopping_metric: str = "val_loss"
 
+    # RankMe on training steps: compute every N optimizer steps (0 = eval only).
+    rank_me_every_n_steps: int = 50
+    rank_me_train_max_rows: int = 256
+
     # Checkpointing — set to "" to disable
     # Best model (by val_loss, or train_loss if no val set) is saved to
     # {checkpoint_dir}/best.pt.  End-of-training model saved to
@@ -237,6 +259,9 @@ class TrainerConfig:
     # masking.strategy from YAML ("span_budget" | "causal_single" | "causal_future").
     # causal_single uses span batch keys (one cut); causal_future uses multi-cut keys.
     masking_strategy: str = "span_budget"
+
+    # Inline linear probe pooling when not using perceiver: "cls" | "mean_pool"
+    probe_pooling: str = "cls"
 
 
 class JEPATrainer(nn.Module):
@@ -321,6 +346,7 @@ class JEPATrainer(nn.Module):
         # metrics from inside the forward (target std-dev, mask ratio) are
         # available without changing the public return signature to 5+ values.
         self._batch_mon: Dict[str, float] = {}
+        self._last_rank_me: float = 0.0
 
     # ------------------------------------------------------------------
     # Forward
@@ -496,7 +522,7 @@ class JEPATrainer(nn.Module):
         target_enc_out = encode_embeddings_with_cls(
             self.encoder, self.cls_token, x, attention_mask
         )  # (B, L+1, d); event index i → position i+1
-        target_spans_list = self._extract_target_spans(
+        target_spans_list, _target_span_pad_masks = self._extract_target_spans(
             target_enc_out, all_target_spans, index_offset=1
         )  # list of num_spans tensors, each (B, N_span_s, d)
 
@@ -511,7 +537,11 @@ class JEPATrainer(nn.Module):
         # 5. Branch routing
         if self.config.use_perceiver:
             l_pred, l_cov = self._forward_perceiver(
-                context_enc_out, ctx_mask, target_spans_list, all_span_times
+                context_enc_out,
+                ctx_mask,
+                target_spans_list,
+                _target_span_pad_masks,
+                all_span_times,
             )
         else:
             if self.config.masking_strategy == "causal_single":
@@ -542,12 +572,20 @@ class JEPATrainer(nn.Module):
                     [t.reshape(-1, t.shape[-1]) for t in target_spans_list], dim=0
                 )  # (N, d)
                 std_dev = all_tgt.std(dim=0).mean().item()
-                # RankMe per-batch: subsample ≤512 rows (SVD on CPU fp64 — stable).
-                rank_me = _rank_me_from_rows(all_tgt[:512])
+                n_rm = self.config.rank_me_train_max_rows
+                every = self.config.rank_me_every_n_steps
+                if (
+                    every > 0
+                    and self._cov_global_step % every == 0
+                ):
+                    rank_me = _rank_me_from_rows(all_tgt[:n_rm])
+                    self._last_rank_me = rank_me
+                else:
+                    rank_me = self._last_rank_me
             else:
                 all_tgt = x.new_zeros((1, x.shape[-1]))
                 std_dev = 0.0
-                rank_me = 0.0
+                rank_me = self._last_rank_me
 
         # Raw token counts — use full-mask totals (see N_target_full above).
         # Ratios in train loop: target_ratio = N_target_full / N_input,
@@ -647,13 +685,17 @@ class JEPATrainer(nn.Module):
                 ctx_out, attention_mask=ctx_mask, position_ids=ctx_pos_ids
             )
 
-            target_spans_list = self._extract_target_spans(
+            target_spans_list, target_span_pad_masks = self._extract_target_spans(
                 target_enc_sub, all_target_spans, index_offset=1
             )
 
             if self.config.use_perceiver:
                 l_p, l_c = self._forward_perceiver(
-                    context_enc_out, ctx_mask, target_spans_list, all_span_times
+                    context_enc_out,
+                    ctx_mask,
+                    target_spans_list,
+                    target_span_pad_masks,
+                    all_span_times,
                 )
             else:
                 l_p, l_c = self._forward_token(
@@ -759,25 +801,29 @@ class JEPATrainer(nn.Module):
         encoder_out: torch.Tensor,
         all_target_spans: List[List[List[int]]],
         index_offset: int = 0,
-    ) -> List[torch.Tensor]:
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
         """
         For each span index s, build a padded tensor [B, max_span_len_s, d]
         containing the target encoder outputs at the span positions.
 
-        Returns a list of num_spans tensors.
+        Returns (span_tensors, pad_masks) where pad_masks[b, j] is True for
+        padded positions (ignored by LatentCrossAttentionPool).
         """
-        B, L, d = encoder_out.shape
+        B, _L, d = encoder_out.shape
         device = encoder_out.device
+        if not all_target_spans or not all_target_spans[0]:
+            return [], []
         num_spans = len(all_target_spans[0])
-        result = []
+        result: List[torch.Tensor] = []
+        pad_masks: List[torch.Tensor] = []
 
         for s in range(num_spans):
             max_span_len = max(len(all_target_spans[b][s]) for b in range(B))
             if max_span_len == 0:
-                result.append(encoder_out.new_zeros(B, 1, d))
                 continue
 
             span_t = encoder_out.new_zeros(B, max_span_len, d)
+            pad_mask = torch.ones(B, max_span_len, dtype=torch.bool, device=device)
             for b in range(B):
                 span_idx = all_target_spans[b][s]
                 n = len(span_idx)
@@ -785,9 +831,11 @@ class JEPATrainer(nn.Module):
                     continue
                 idx_t = torch.tensor(span_idx, dtype=torch.long, device=device)
                 span_t[b, :n] = encoder_out[b][idx_t + index_offset]
+                pad_mask[b, :n] = False
             result.append(span_t)
+            pad_masks.append(pad_mask)
 
-        return result
+        return result, pad_masks
 
     # ------------------------------------------------------------------
     # Branch A: Perceiver-JEPA
@@ -798,6 +846,7 @@ class JEPATrainer(nn.Module):
         context_enc_out: torch.Tensor,
         ctx_mask: torch.Tensor,
         target_spans_list: List[torch.Tensor],
+        target_span_pad_masks: List[torch.Tensor],
         all_span_times: List[List[Tuple[float, float]]],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -829,8 +878,19 @@ class JEPATrainer(nn.Module):
             if span_len < min_span:
                 continue
 
+            pad_mask = (
+                target_span_pad_masks[s]
+                if s < len(target_span_pad_masks)
+                else torch.zeros(
+                    span_tokens.shape[0],
+                    span_tokens.shape[1],
+                    dtype=torch.bool,
+                    device=span_tokens.device,
+                )
+            )
+
             # Target perceiver → (B, n_latents, d)
-            Z_tgt = self.target_pooler(span_tokens)
+            Z_tgt = self.target_pooler(span_tokens, key_padding_mask=pad_mask)
 
             # Temporal prompt for this span
             coords = self._span_coords_for_span(all_span_times, s, device)  # (B, 2)
@@ -865,6 +925,16 @@ class JEPATrainer(nn.Module):
         l_pred = torch.stack(pred_losses).mean()
         l_cov  = torch.stack(cov_losses).mean()
         return l_pred, l_cov
+
+    def _proj_token_targets(
+        self, y_hat: torch.Tensor, y_tgt: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Linear+BN projection for Branch B (same role as perceiver proj heads)."""
+        if self.target_proj is not None:
+            y_tgt = self.target_proj(y_tgt)
+        if self.pred_proj is not None:
+            y_hat = self.pred_proj(y_hat)
+        return y_hat, y_tgt
 
     # ------------------------------------------------------------------
     # Branch B: Token I-JEPA
@@ -1003,7 +1073,6 @@ class JEPATrainer(nn.Module):
         Downstream probing still uses encoder [CLS | events] (target pathway);
         predictor CLS is trained with context-only visibility to future MASKs.
         """
-        del all_span_times  # positional only for causal_single token branch
         if not target_spans_list:
             z = _zero_loss_connected(context_enc_out)
             return z, z
@@ -1037,6 +1106,9 @@ class JEPATrainer(nn.Module):
         pos_cat = torch.zeros(B_eff, max_compact, dtype=torch.long, device=device)
         attn_cat = torch.zeros(B_eff, max_compact, dtype=torch.long, device=device)
 
+        coords = self._span_coords_for_span(all_span_times, span_idx, device)
+        span_prompt = self.prompt(coords.unsqueeze(1))  # (B, 1, d)
+
         for bi, b in enumerate(valid_bs):
             nc, nt = lengths_c[b], lengths_t[b]
             x_cat[bi, 0] = self.cls_token
@@ -1046,9 +1118,10 @@ class JEPATrainer(nn.Module):
                 x_cat[bi, 1 : 1 + nc] = context_enc_out[b, :nc]
                 pos_cat[bi, 1 : 1 + nc] = ctx_pos_ids[b, :nc]
                 attn_cat[bi, 1 : 1 + nc] = 1
+            mask_vec = self.mask_token + span_prompt[b, 0, :]
             tgt_idx = all_target_spans[b][span_idx]
             for j, p in enumerate(tgt_idx[:nt]):
-                x_cat[bi, 1 + nc + j] = self.mask_token
+                x_cat[bi, 1 + nc + j] = mask_vec
                 pos_cat[bi, 1 + nc + j] = int(p)
                 attn_cat[bi, 1 + nc + j] = 1
 
@@ -1104,6 +1177,8 @@ class JEPATrainer(nn.Module):
         if not torch.isfinite(y_hat).all() or not torch.isfinite(y_tgt).all():
             z = _zero_loss_connected(context_enc_out)
             return z, z
+
+        y_hat, y_tgt = self._proj_token_targets(y_hat, y_tgt)
 
         if use_time_decay:
             l_pred = jepa_prediction_loss_token_masked(
@@ -1175,6 +1250,7 @@ class JEPATrainer(nn.Module):
             y_hat = self._extract_span_outputs(
                 out, all_target_spans, s, N_span
             )
+            y_hat, y_tgt = self._proj_token_targets(y_hat, y_tgt)
 
             use_time_decay = (
                 self.config.future_time_decay_lambda > 0
@@ -1315,16 +1391,18 @@ class JEPATrainer(nn.Module):
         """
         import gc
         import torch.nn as _nn
-        from evaluation.linear_probe import FrozenEHREncoder, LinearProbe
+        from evaluation.linear_probe import LinearProbe, build_frozen_jepa_encoder
+        from models.sequence_pooling import parse_pooling_mode
 
         is_dist = (world_size > 1)
-        pooler  = self.context_pooler
+        probe_pooling = parse_pooling_mode(self.config.probe_pooling)
 
-        encoder = FrozenEHREncoder(
+        encoder = build_frozen_jepa_encoder(
             embedding=self.embedding,
             encoder=self.encoder,
-            pooler=pooler,
-            cls_token=None if pooler is not None else self.cls_token,
+            context_pooler=self.context_pooler,
+            cls_token=self.cls_token,
+            pooling_mode=probe_pooling,
         ).to(device)
 
         probe = LinearProbe(encoder.output_dim, dropout=dropout).to(device)
@@ -1566,7 +1644,8 @@ class JEPATrainer(nn.Module):
             "train_loss": [], "val_loss": [], "lr": []
         }
 
-        best_metric        = float("inf")
+        es_higher = _early_stopping_higher_is_better(cfg.early_stopping_metric)
+        best_metric        = -float("inf") if es_higher else float("inf")
         best_ckpt_metric   = float("inf")   # tracks best val/train loss for checkpointing
         best_probe_auroc   = -float("inf")  # tracks best probe val_auroc for probe_best.pt
         patience_left      = cfg.early_stopping_patience
@@ -1853,7 +1932,7 @@ class JEPATrainer(nn.Module):
                 monitor = epoch_metrics.get(cfg.early_stopping_metric)
                 if monitor is None:
                     pass
-                elif monitor < best_metric:
+                elif _early_stopping_improved(monitor, best_metric, es_higher):
                     best_metric   = monitor
                     patience_left = cfg.early_stopping_patience
                 else:

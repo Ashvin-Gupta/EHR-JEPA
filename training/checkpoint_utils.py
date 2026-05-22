@@ -8,6 +8,10 @@ JEPA (JEPATrainer.state_dict):
 BERT (BERTTrainer.state_dict, keys under ``model.``):
   - backbone.pt   — model.embedding + model.encoder
   - bert_aux.pt   — CLS, MLM head, mask embedding (continue MLM pretrain)
+
+AR (ARTrainer.state_dict, keys under ``model.``):
+  - backbone.pt   — model.embedding + model.encoder
+  - ar_aux.pt     — CLS, EOS, LM head (continue AR pretrain)
 """
 
 from __future__ import annotations
@@ -121,6 +125,51 @@ def save_bert_split_checkpoints(model_state: Dict[str, torch.Tensor], directory:
     os.makedirs(directory, exist_ok=True)
     torch.save(parts["backbone"], os.path.join(directory, "backbone.pt"))
     torch.save(parts["bert_aux"], os.path.join(directory, "bert_aux.pt"))
+
+
+def split_ar_trainer_state_dict(
+    full_sd: Dict[str, torch.Tensor],
+) -> Dict[str, Dict[str, torch.Tensor]]:
+    """Partition ARTrainer state_dict (DDP may add ``module.`` prefix)."""
+    backbone: Dict[str, torch.Tensor] = {}
+    aux: Dict[str, torch.Tensor] = {}
+
+    for k, v in full_sd.items():
+        nk = k[len("module.") :] if k.startswith("module.") else k
+        if nk.startswith("model.embedding.") or nk.startswith("model.encoder."):
+            backbone[k] = v
+        else:
+            aux[k] = v
+    return {"backbone": backbone, "ar_aux": aux}
+
+
+def load_ar_backbone_state_dict(checkpoint_path: str) -> Dict[str, torch.Tensor]:
+    """Embedding+encoder tensors from AR backbone or full trainer checkpoint."""
+    obj = torch.load(checkpoint_path, map_location="cpu")
+    if isinstance(obj, dict) and "model_state" in obj:
+        obj = obj["model_state"]
+    if not isinstance(obj, dict):
+        raise ValueError(f"Expected checkpoint dict at {checkpoint_path!r}")
+    return split_ar_trainer_state_dict(obj)["backbone"]
+
+
+def ar_backbone_state_dict_for_arehrmodel(
+    backbone_sd: Dict[str, torch.Tensor],
+) -> Dict[str, torch.Tensor]:
+    """Map ``model.embedding.*`` / DDP ``module.`` keys → ``embedding.*`` for AREHRModel."""
+    out: Dict[str, torch.Tensor] = {}
+    for k, v in backbone_sd.items():
+        nk = k[len("module.") :] if k.startswith("module.") else k
+        nk = nk[len("model.") :] if nk.startswith("model.") else nk
+        out[nk] = v
+    return out
+
+
+def save_ar_split_checkpoints(model_state: Dict[str, torch.Tensor], directory: str) -> None:
+    parts = split_ar_trainer_state_dict(model_state)
+    os.makedirs(directory, exist_ok=True)
+    torch.save(parts["backbone"], os.path.join(directory, "backbone.pt"))
+    torch.save(parts["ar_aux"], os.path.join(directory, "ar_aux.pt"))
 
 
 def load_backbone_into_module(

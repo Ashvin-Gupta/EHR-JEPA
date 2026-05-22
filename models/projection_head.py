@@ -21,20 +21,22 @@ Vision Transformer.
 
 Usage
 -----
-Applied symmetrically to BOTH pathways:
+Applied symmetrically to both JEPA branches when ``use_proj_head`` is true:
 
-  Target pathway:
-    target_pooler (→ LayerNorm) → ProjectionHead → Z_tgt_proj
+  Branch A (perceiver):
+    target_pooler (→ LayerNorm) → target_proj → Z_tgt_proj
+    predictor     (→ LayerNorm) → pred_proj   → Z_hat_proj
 
-  Predictor pathway:
-    predictor    (→ LayerNorm) → ProjectionHead → Z_hat_proj
+  Branch B (token):
+    target encoder span rows → target_proj → Y_tgt_proj
+    token predictor outputs  → pred_proj   → Y_hat_proj
 
-  Loss:
-    MSE(Z_hat_proj, stop_grad(Z_tgt_proj))  +  λ · CovReg(Z_tgt_proj)
+  Loss (both branches):
+    MSE(pred_proj output, stop_grad(target_proj output))
+    +  λ · CovReg(target_proj output)
 
-The downstream linear probe uses the *raw* perceiver output (before this
-head), following standard SSL practice where the projection head is treated
-as a training artefact rather than part of the learned representation.
+Downstream probing uses raw encoder / pooler outputs (before projection),
+following standard SSL practice.
 """
 
 from __future__ import annotations

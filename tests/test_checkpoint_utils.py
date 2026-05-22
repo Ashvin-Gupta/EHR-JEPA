@@ -8,11 +8,13 @@ import tempfile
 import torch
 
 from training.checkpoint_utils import (
+    ar_backbone_state_dict_for_arehrmodel,
     assert_jepa_split_covers_full,
     bert_backbone_state_dict_for_bertehrmodel,
     load_jepa_backbone_state_dict,
     merge_jepa_split_state_dict,
     save_jepa_split_checkpoints,
+    split_ar_trainer_state_dict,
     split_bert_trainer_state_dict,
     split_jepa_state_dict,
 )
@@ -100,3 +102,18 @@ def test_bert_split_and_strip_prefix():
     parts = split_bert_trainer_state_dict(sd)
     inner = bert_backbone_state_dict_for_bertehrmodel(parts["backbone"])
     assert set(inner.keys()) == {"embedding.weight", "encoder.layer"}
+
+
+def test_ar_split_and_strip_prefix():
+    sd = {
+        "model.embedding.weight": torch.randn(2, 2),
+        "model.encoder.layer": torch.randn(3),
+        "model.cls_token": torch.randn(1),
+        "model.eos_token": torch.randn(1),
+        "model.lm_head.0.weight": torch.randn(4, 4),
+    }
+    parts = split_ar_trainer_state_dict(sd)
+    inner = ar_backbone_state_dict_for_arehrmodel(parts["backbone"])
+    assert set(inner.keys()) == {"embedding.weight", "encoder.layer"}
+    assert "model.cls_token" in parts["ar_aux"]
+    assert "model.eos_token" in parts["ar_aux"]

@@ -267,8 +267,11 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
         dropout=t.get("dropout", 0.1),
     ))
 
+    from models.sequence_pooling import get_config_pooling
+
     trainer_cfg = TrainerConfig(
         use_perceiver=use_perceiver,
+        probe_pooling=get_config_pooling(cfg, "downstream"),
         min_span_for_perceiver=p.get("min_span_for_perceiver", 15),
         use_proj_head=use_proj_head,
         lambda_cov=lc.get("lambda_cov", 0.1),
@@ -292,6 +295,8 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
         min_lr_ratio=tr.get("min_lr_ratio", 0.1),
         early_stopping_patience=tr.get("early_stopping_patience", 5),
         early_stopping_metric=tr.get("early_stopping_metric", "val_loss"),
+        rank_me_every_n_steps=int(tr.get("rank_me_every_n_steps", 50)),
+        rank_me_train_max_rows=int(tr.get("rank_me_train_max_rows", 256)),
         checkpoint_dir=tr.get("checkpoint_dir", ""),
         n_epochs=tr.get("n_epochs", 10),
         device="cuda" if torch.cuda.is_available() else "cpu",
@@ -730,17 +735,24 @@ def _run_final_probe_test(
     # Build the frozen encoder — BERT and JEPA have different wrappers but
     # both satisfy the same (codes, attention_mask, ...) → (B, output_dim) interface.
     from training.bert_trainer import BERTTrainer as _BERTTrainer
+    from training.ar_trainer import ARTrainer as _ARTrainer
+    from models.sequence_pooling import get_config_pooling
+
+    probe_pooling = get_config_pooling(cfg, "downstream")
     if isinstance(trainer, _BERTTrainer):
         from evaluation.frozen_bert_encoder import FrozenBERTEncoder
-        encoder = FrozenBERTEncoder(trainer.model).to(device)
+        encoder = FrozenBERTEncoder(trainer.model, pooling_mode=probe_pooling).to(device)
+    elif isinstance(trainer, _ARTrainer):
+        from evaluation.frozen_ar_encoder import FrozenAREncoder
+        encoder = FrozenAREncoder(trainer.model, pooling_mode=probe_pooling).to(device)
     else:
-        from evaluation.linear_probe import FrozenEHREncoder
-        pooler = trainer.context_pooler
-        encoder = FrozenEHREncoder(
+        from evaluation.linear_probe import build_frozen_jepa_encoder
+        encoder = build_frozen_jepa_encoder(
             embedding=trainer.embedding,
             encoder=trainer.encoder,
-            pooler=pooler,
-            cls_token=None if pooler is not None else trainer.cls_token,
+            context_pooler=trainer.context_pooler,
+            cls_token=trainer.cls_token,
+            pooling_mode=probe_pooling,
         ).to(device)
 
     probe = LinearProbe(

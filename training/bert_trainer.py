@@ -54,6 +54,7 @@ from models.event_embedding import EventEmbedding
 from models.transformer_encoder import EHRTransformerEncoder, TransformerEncoderConfig
 
 from training.checkpoint_utils import save_bert_split_checkpoints
+from training.trainer import _early_stopping_higher_is_better, _early_stopping_improved
 
 
 # ---------------------------------------------------------------------------
@@ -91,6 +92,9 @@ class BERTConfig:
     # Training
     n_epochs: int = 10
     device: str = "cpu"
+
+    # Inline linear probe: "cls" | "mean_pool"
+    probe_pooling: str = "cls"
 
 
 # ---------------------------------------------------------------------------
@@ -201,6 +205,27 @@ class BERTEHRModel(nn.Module):
         )
         return h[:, 0, :]
 
+    def encode_pooled_embedding(
+        self,
+        input_codes: torch.Tensor,
+        attention_mask: torch.Tensor,
+        values: Optional[torch.Tensor] = None,
+        z_scores: Optional[torch.Tensor] = None,
+        delta_times: Optional[torch.Tensor] = None,
+        value_mask: Optional[torch.Tensor] = None,
+        pooling_mode: str = "cls",
+    ) -> torch.Tensor:
+        """Sequence-level embedding for downstream (CLS or mean over events)."""
+        from models.sequence_pooling import mean_pool_sequence, parse_pooling_mode
+
+        mode = parse_pooling_mode(pooling_mode)
+        h, _L = self._encode_with_cls(
+            input_codes, attention_mask, values, z_scores, delta_times, value_mask
+        )
+        if mode == "cls":
+            return h[:, 0, :]
+        return mean_pool_sequence(h[:, 1:, :], attention_mask)
+
     @property
     def output_dim(self) -> int:
         return self.encoder.config.d_model
@@ -300,8 +325,11 @@ class BERTTrainer(nn.Module):
     ) -> Dict[str, float]:
         from evaluation.linear_probe import LinearProbe, train_linear_probe
         from evaluation.frozen_bert_encoder import FrozenBERTEncoder
+        from models.sequence_pooling import parse_pooling_mode
 
-        encoder = FrozenBERTEncoder(self.model).to(device)
+        encoder = FrozenBERTEncoder(
+            self.model, pooling_mode=parse_pooling_mode(self.config.probe_pooling)
+        ).to(device)
         probe   = LinearProbe(encoder.output_dim, dropout=dropout).to(device)
 
         history, final_val = train_linear_probe(
@@ -377,7 +405,8 @@ class BERTTrainer(nn.Module):
 
         history: Dict[str, List[float]] = {"train_loss": [], "val_loss": [], "lr": []}
 
-        best_metric      = float("inf")
+        es_higher        = _early_stopping_higher_is_better(cfg.early_stopping_metric)
+        best_metric      = -float("inf") if es_higher else float("inf")
         best_ckpt_metric = float("inf")
         best_probe_auroc = -float("inf")
         patience_left    = cfg.early_stopping_patience
@@ -534,7 +563,7 @@ class BERTTrainer(nn.Module):
                 if cfg.early_stopping_patience > 0:
                     monitor = epoch_metrics.get(cfg.early_stopping_metric)
                     if monitor is not None:
-                        if monitor < best_metric:
+                        if _early_stopping_improved(monitor, best_metric, es_higher):
                             best_metric   = monitor
                             patience_left = cfg.early_stopping_patience
                         else:

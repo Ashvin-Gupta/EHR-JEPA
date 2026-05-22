@@ -1,7 +1,7 @@
-# EHR-BERT configuration — BERT-style MLM pretraining baseline
+# EHR-AR configuration — autoregressive next-token pretraining baseline
 #
-# Deliberately mirrors ehr_config.yaml wherever possible so comparisons
-# between the JEPA and BERT baselines are fair.
+# Deliberately mirrors bert_config.yaml wherever possible so comparisons
+# between JEPA, BERT, and AR baselines are fair.
 
 seed: 42
 
@@ -37,20 +37,14 @@ transformer:
   ffn_dim: 256
   dropout: 0.1
 
-mlm:
-  # Total fraction of real tokens selected for masking
-  mask_ratio: 0.15
-  # Of selected tokens: replaced with [MASK] token
-  mask_token_frac: 0.8333    # 12.5 / 15
-  # Of selected tokens: replaced with a random vocabulary token
-  random_frac: 0.1667        # 2.5 / 15
-  # Remainder (0%) are kept unchanged
+ar:
+  # Pack multiple subject trajectories end-to-end per batch row:
+  # [CLS|seq1|EOS|CLS|seq2|EOS|…]
+  pack_sequences: true
 
 training:
   task: "pretrain"
   max_seq_len: 1024
-  # Per-GPU batch size — kept small to avoid OOM at d_model=768 / seq_len=512.
-  # With 4 GPUs and gradient_accumulation_steps=6, effective batch ≈ 96*4=384.
   batch_size: 128
   gradient_accumulation_steps: 4
   num_workers: 8
@@ -71,11 +65,8 @@ training:
 
   n_epochs: 30
 
-  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/bert_checkpoints"
+  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/ar_checkpoints"
 
-# ---------------------------------------------------------------------------
-# Inline downstream evaluation — same structure as ehr_config.yaml
-# ---------------------------------------------------------------------------
 downstream:
   enabled: false
   inline_probe_during_pretrain: false
@@ -83,14 +74,11 @@ downstream:
   probe_lr: 1.0e-3
   probe_dropout: 0.1
   probe_batch_size: 64
-  # Limit val (tuning) loader to N files for fast inline evaluation.
   probe_max_files: 5
-  # Run the inline probe every N epochs (epoch 1 always runs regardless).
   probe_interval: 5
 
-# Supervised downstream (main_supervised_downstream.py) — mirror ehr_config downstream_eval
 downstream_eval:
-  mode: bert
+  mode: ar
   pooling: mean_pool
   head_type: linear
   head_dropout: 0.2

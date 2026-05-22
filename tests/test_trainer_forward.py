@@ -250,6 +250,19 @@ def test_branch_b_code_plus_value_plus_time():
     assert not torch.isnan(l_total)
 
 
+def test_branch_b_proj_head_gradients():
+    """use_proj_head applies Linear+BN to Y_hat/Y_tgt before losses."""
+    trainer = _build_trainer(use_perceiver=False)
+    assert trainer.target_proj is not None and trainer.pred_proj is not None
+    codes, attn_mask, *_ = _make_batch()
+    l_pred, l_cov, l_total = trainer(codes, attn_mask)
+    l_total.backward()
+    assert trainer.target_proj.linear.weight.grad is not None
+    assert trainer.target_proj.linear.weight.grad.norm().item() > 0
+    assert trainer.pred_proj.linear.weight.grad is not None
+    assert trainer.pred_proj.linear.weight.grad.norm().item() > 0
+
+
 def test_branch_b_gradient_flow():
     """
     Branch B gradient flow:
@@ -537,6 +550,53 @@ def test_causal_skips_cut_when_any_row_has_empty_context():
     pre = {"mask_causal_contexts": cc, "mask_causal_targets": tt, "mask_causal_span_times": st}
     l_pred, l_cov, l_total = trainer(codes, attn, pre_mask=pre)
     assert torch.isfinite(l_pred) and torch.isfinite(l_cov) and torch.isfinite(l_total)
+
+
+def test_target_perceiver_pad_mask_ignored():
+    """Padded span positions must not change target_pooler output."""
+    trainer = _build_trainer(use_perceiver=True, min_span_for_perceiver=3)
+    B, n_real, n_pad, d = 2, 6, 2, D
+    real = torch.randn(B, n_real, d)
+    pad_a = torch.randn(B, n_pad, d)
+    pad_b = torch.randn(B, n_pad, d) * 100.0
+    span_a = torch.cat([real, pad_a], dim=1)
+    span_b = torch.cat([real, pad_b], dim=1)
+    pad_mask = torch.zeros(B, n_real + n_pad, dtype=torch.bool)
+    pad_mask[:, n_real:] = True
+
+    z_real = trainer.target_pooler(real)
+    z_a = trainer.target_pooler(span_a, key_padding_mask=pad_mask)
+    z_b = trainer.target_pooler(span_b, key_padding_mask=pad_mask)
+    assert torch.allclose(z_real, z_a, atol=1e-5)
+    assert torch.allclose(z_real, z_b, atol=1e-5)
+
+
+def test_causal_single_temporal_prompt_affects_loss():
+    """Non-zero mask_span_times must change loss and train TemporalSpanPrompt."""
+    trainer = _build_trainer(
+        use_perceiver=False,
+        masking_strategy="causal_single",
+        min_span_for_perceiver=5,
+    )
+    L = 64
+    codes = torch.randint(0, VOCAB, (2, L))
+    attn = torch.ones(2, L, dtype=torch.long)
+    cut = 14
+    ctx = list(range(0, cut + 1))
+    tgt = list(range(cut + 1, cut + 28))
+    base = {
+        "mask_context_indices": [ctx, ctx],
+        "mask_target_spans": [[tgt], [tgt]],
+    }
+    pre_zero = {**base, "mask_span_times": [[(0.0, 0.0)], [(0.0, 0.0)]]}
+    pre_nz = {**base, "mask_span_times": [[(5.0, 10.0)], [(8.0, 12.0)]]}
+    l0, _, t0 = trainer(codes, attn, pre_mask=pre_zero)
+    l1, _, t1 = trainer(codes, attn, pre_mask=pre_nz)
+    assert torch.isfinite(t0) and torch.isfinite(t1)
+    assert l0.item() != l1.item()
+    t1.backward()
+    assert trainer.prompt.mlp[0].weight.grad is not None
+    assert trainer.prompt.mlp[0].weight.grad.norm().item() > 0
 
 
 def test_shared_encoder_weights():

@@ -127,7 +127,8 @@ def test_impossible_sequence_returns_empty_target():
     )
     L = 20
     r = m(seq_len=L, attention_mask=[1] * L, times_hours=_hours_linear(L))
-    assert r.target_spans == [[]]
+    assert r.target_spans == []
+    assert r.span_times == []
 
 
 def test_target_delta_minutes_from_cut():

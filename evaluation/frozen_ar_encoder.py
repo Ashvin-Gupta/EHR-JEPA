@@ -1,37 +1,32 @@
-"""BERT encoder + configurable head for supervised binary classification."""
+"""
+FrozenAREncoder — frozen AR backbone feature extractor for linear probing.
+
+Interface matches FrozenBERTEncoder / FrozenEHREncoder:
+    (codes, attention_mask, ...) → (B, d_model)
+"""
 
 from __future__ import annotations
 
-from typing import Literal, Optional
+from typing import Optional
 
 import torch
 import torch.nn as nn
 
-from evaluation.supervised_perceiver import build_classification_head
 from models.sequence_pooling import SequencePoolingMode, parse_pooling_mode
-from training.bert_trainer import BERTEHRModel
-
-HeadType = Literal["linear", "mlp"]
 
 
-class BERTSupervisedClassifier(nn.Module):
-    """Pooled BERT sequence embedding → linear or MLP → logit (BCEWithLogits)."""
-
+class FrozenAREncoder(nn.Module):
     def __init__(
         self,
-        bert: BERTEHRModel,
-        head_type: HeadType = "linear",
-        head_dropout: float = 0.1,
+        ar_model: "AREHRModel",  # noqa: F821
         pooling_mode: SequencePoolingMode = "cls",
     ) -> None:
         super().__init__()
-        self.bert = bert
+        self.ar_model = ar_model
         self.pooling_mode = parse_pooling_mode(pooling_mode)
-        d_model = bert.output_dim
-        self.head = build_classification_head(
-            d_model, d_model, head_type, head_dropout
-        )
+        self.output_dim: int = ar_model.output_dim
 
+    @torch.no_grad()
     def forward(
         self,
         codes: torch.Tensor,
@@ -41,7 +36,7 @@ class BERTSupervisedClassifier(nn.Module):
         delta_times: Optional[torch.Tensor] = None,
         value_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        pooled = self.bert.encode_pooled_embedding(
+        return self.ar_model.encode_pooled_embedding(
             codes,
             attention_mask,
             values=values,
@@ -50,4 +45,3 @@ class BERTSupervisedClassifier(nn.Module):
             value_mask=value_mask,
             pooling_mode=self.pooling_mode,
         )
-        return self.head(pooled).squeeze(-1)

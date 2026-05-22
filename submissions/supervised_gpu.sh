@@ -1,4 +1,12 @@
 #!/bin/bash
+# Usage:
+#   sbatch submissions/supervised_gpu.sh [TASK]
+#   sbatch --job-name=sup-jepa-hosp submissions/supervised_gpu.sh hospital_mortality
+#
+# TASK (optional) overrides data.labels_task in the config, e.g.:
+#   icu_mortality | hospital_mortality | hospital_readmission
+# If omitted, the value from configs/ehr_config.yaml is used.
+
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
@@ -26,9 +34,20 @@ export PYTHONPATH="${BASE_DIR}:${PYTHONPATH}"
 # Disable Python output buffering so the log file updates in real-time
 export PYTHONUNBUFFERED=1
 
+TASK="${1:-}"
+
 echo "Job ID:   ${SLURM_JOB_ID}"
 echo "Log file: logs/Supervised/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
-python main_supervised_downstream.py --config configs/ehr_config.yaml
+
+PYTHON_ARGS=(--config configs/ehr_config.yaml)
+if [[ -n "${TASK}" ]]; then
+  PYTHON_ARGS+=(--task "${TASK}")
+  echo "Task: ${TASK} (overrides data.labels_task)"
+else
+  echo "Task: from config (data.labels_task)"
+fi
+
+python main_supervised_downstream.py "${PYTHON_ARGS[@]}"
 
 echo "Supervised finished."
 

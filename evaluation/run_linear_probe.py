@@ -50,12 +50,12 @@ from data.meds_dataset import MEDSDataset
 from data.normalizer import ValueNormalizer
 from data.vocab import Vocab
 from evaluation.linear_probe import (
-    FrozenEHREncoder,
     LinearProbe,
     _eval_probe,
     load_frozen_encoder_from_checkpoint,
     train_linear_probe,
 )
+from models.sequence_pooling import get_eval_pooling
 from evaluation.downstream_dataset import DownstreamDataset
 from main import build_model, _ensure_vocab, _ensure_normalizer
 
@@ -173,7 +173,10 @@ def main() -> None:
     device  = "cuda" if torch.cuda.is_available() else "cpu"
 
     print(f"[checkpoint] Loading from '{args.checkpoint}' …")
-    encoder = load_frozen_encoder_from_checkpoint(args.checkpoint, trainer)
+    pooling = get_eval_pooling(cfg)
+    encoder = load_frozen_encoder_from_checkpoint(
+        args.checkpoint, trainer, pooling_mode=pooling
+    )
     encoder = encoder.to(device)
     print(f"[model] Encoder output dim: {encoder.output_dim}")
 

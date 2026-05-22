@@ -6,34 +6,25 @@
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
 #SBATCH --output=/home/ag619/EHR-JEPA/logs/Supervised/%x_%j.log
-#SBATCH --job-name=sup-bert
-
+#SBATCH --job-name=sup-ar
 
 # Usage:
-#   sbatch submissions/supervised_bert_gpu.sh [TASK]
-#   sbatch --job-name=sup-bert-icu submissions/supervised_bert_gpu.sh icu_mortality
+#   sbatch submissions/supervised_ar_gpu.sh [TASK]
+#   sbatch --job-name=sup-ar-icu submissions/supervised_ar_gpu.sh icu_mortality
 #
-# TASK (optional) overrides data.labels_task in the config, e.g.:
-#   icu_mortality | hospital_mortality | hospital_readmission
-# If omitted, the value from configs/bert_config.yaml is used.
-
+# TASK (optional) overrides data.labels_task in the config.
 
 set -e
 
-# Set the base directory for your project
 BASE_DIR="/home/ag619/EHR-JEPA"
 
 export WANDB_API_KEY="3256683a0a9a004cf52e04107a3071099a53038e"
 
-
-# --- Execute from Project Root ---
 cd "${BASE_DIR}"
 echo "Activating virtual environment..."
 source .venv/bin/activate
 
-
 export PYTHONPATH="${BASE_DIR}:${PYTHONPATH}"
-# Disable Python output buffering so the log file updates in real-time
 export PYTHONUNBUFFERED=1
 
 TASK="${1:-}"
@@ -42,8 +33,8 @@ echo "Job ID:   ${SLURM_JOB_ID}"
 echo "Log file: logs/Supervised/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
 
 PYTHON_ARGS=(
-  --config configs/bert_config.yaml
-  --checkpoint /home/ag619/EHR-JEPA-Data/bert_checkpoints/6_layer_1024/best.pt
+  --config configs/ar_config.yaml
+  --checkpoint /home/ag619/EHR-JEPA-Data/ar_checkpoints/best.pt
 )
 if [[ -n "${TASK}" ]]; then
   PYTHON_ARGS+=(--task "${TASK}")
@@ -54,6 +45,6 @@ fi
 
 python main_supervised_downstream.py "${PYTHON_ARGS[@]}"
 
-echo "Supervised finished."
+echo "Supervised AR finished."
 
 deactivate

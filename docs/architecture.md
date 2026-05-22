@@ -57,7 +57,7 @@ flowchart TD
 
         subgraph targetPath ["Target Pathway  (always with grad)"]
             TP1["encoder(x_full [B,L,d])\n6-layer RoPE Transformer\nOUT: target_enc_out [B,L,d]"]
-            TP1 --> TP2["_extract_target_spans()\ngather span token rows\nOUT: List of [B, N_span, d]"]
+            TP1 --> TP2["_extract_target_spans()\ngather span token rows + pad mask\nOUT: List of [B, N_span, d], pad_masks"]
         end
 
         subgraph contextPath ["Context Pathway  (compact + original pos IDs)"]
@@ -70,7 +70,7 @@ flowchart TD
 
         subgraph branchA ["Branch A: Perceiver-JEPA"]
             BA1["context_pooler(context_enc_out)\n16 queries cross-attend context\nOUT: Z_ctx [B, 16, d]"]
-            BA2["target_pooler(span_tokens)\n16 queries cross-attend span\nOUT: Z_tgt [B, 16, d]\nskip if N_span < 15"]
+            BA2["target_pooler(span_tokens, key_padding_mask)\n16 queries cross-attend span\nOUT: Z_tgt [B, 16, d]\nskip if N_span < 15"]
             BA3["TemporalSpanPrompt(midpoint, duration)\nOUT: prompt [B, 1, d]"]
             BA4["LayerNorm(Z_ctx + prompt)\nOUT: Z_prompted [B, 16, d]"]
             BA5["Predictor.transformer(Z_prompted)\n2-layer shallow Transformer\nOUT: Z_hat [B, 16, d]"]
@@ -83,9 +83,10 @@ flowchart TD
             BB2["mask_token param [d] + span_prompt\nOUT: mask_tokens [B, N_span, d]"]
             BB3["cat(context_enc_out, mask_tokens)\npos_ids = cat(ctx_pos, span_pos)\nOUT: x_in [B, N_ctx+N_span, d]"]
             BB4["token_predictor(x_in, pos_ids)\nmask tokens can query context\nOUT: [B, N_ctx+N_span, d]"]
-            BB5["slice out[:, N_ctx:, :]\nOUT: Y_hat [B, N_span, d]"]
-            BB6["L_pred = MSE(Y_hat, Y_tgt.detach())\nstop-grad"]
-            BB7["L_cov = CovReg(Y_tgt)  no detach\ntrains target encoder"]
+            BB5["slice target positions\nOUT: Y_hat [B, N_span, d]"]
+            BB5a["[optional] target_proj / pred_proj\nLinear + BN1d free space"]
+            BB6["L_pred = MSE(Y_hat_proj, Y_tgt_proj.detach())"]
+            BB7["L_cov = CovReg(Y_tgt_proj)  no detach"]
         end
 
         branchRoute -->|True| BA1
@@ -104,9 +105,10 @@ flowchart TD
         BB2 --> BB3
         BB3 --> BB4
         BB4 --> BB5
-        BB5 --> BB6
-        TP2 -->|Y_tgt| BB6
-        TP2 -->|Y_tgt| BB7
+        BB5 --> BB5a
+        BB5a --> BB6
+        TP2 -->|Y_tgt| BB5a
+        BB5a --> BB7
 
         BA6 --> lossTotal["L_total = L_pred + 0.1 × L_cov"]
         BA7 --> lossTotal
@@ -178,4 +180,6 @@ Both `CtxEnc` and `TgtEnc` are the **same `nn.Module` instance** — the shared 
 
 All causal cutpoints are chosen on the **windowed** sequence after `MEDSCollator` (random slice if longer than `max_seq_len`, else pad). `causal_single` is the efficient default when you want temporal prediction without multi-cut context encoder cost.
 
-**Branch B + `causal_single`:** target encoder on `[CLS | events]`; context prefix re-encoded; predictor input is **compact** `[CLS | context_enc | learnable MASK@future]` (RoPE: CLS at 0, events at original indices). `predictor.causal_single_attn`: `bidirectional` or `quadrant` (CLS/context cannot attend to MASK slots; MASK slots may attend to CLS+context; target↔target diagonal). **Downstream** probe / supervised CLS uses **encoder** `[CLS | events]` from the target pathway, not predictor outputs. Optional time-decay on target tokens. Invalid rows skipped before the predictor batch.
+**Branch B + `causal_single`:** target encoder on `[CLS | events]`; context prefix re-encoded; predictor input is **compact** `[CLS | context_enc | learnable MASK@future]` (RoPE: CLS at 0, events at original indices). MASK slots use `mask_token + TemporalSpanPrompt(midpoint, duration)` (same as span-budget token path). `predictor.causal_single_attn`: `bidirectional` or `quadrant` (CLS/context cannot attend to MASK slots; MASK slots may attend to CLS+context; target↔target diagonal). **Downstream** probe / supervised CLS uses **encoder** `[CLS | events]` from the target pathway, not predictor outputs. Optional time-decay on target tokens. Invalid rows skipped before the predictor batch.
+
+**Training monitoring:** RankMe SVD runs every `training.rank_me_every_n_steps` train steps (subsample `rank_me_train_max_rows` rows); always computed on validation. Early stopping minimizes metrics whose names contain `loss`, and maximizes `auroc`, `aupr`, `accuracy`, `rank_me`, `f1`, etc. Impossible `causal_single` masks return `target_spans=[]` (not `[[]]`) so the trainer uses the zero-loss path.
