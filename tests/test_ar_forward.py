@@ -32,9 +32,9 @@ def test_ar_forward_finite_loss():
     codes = torch.randint(1, 18, (B, L))
     attn = torch.ones(B, L, dtype=torch.long)
     attn[1, 5:] = 0
-    loss, cls_emb = model(codes, attn)
+    loss, summary = model(codes, attn)
     assert torch.isfinite(loss).all()
-    assert cls_emb.shape == (B, 16)
+    assert summary.shape == (B, 16)
 
 
 def test_ar_forward_gradient_flow():
@@ -44,8 +44,23 @@ def test_ar_forward_gradient_flow():
     loss, _ = model(codes, attn)
     loss.backward()
     assert model.cls_token.grad is not None
-    assert model.eos_token.grad is not None
     assert model.lm_head[0].weight.grad is not None
+
+
+def test_ar_shifted_labels_no_cls_ignore():
+    """CLS at input pos 0 must predict event_0, not be ignored with identity leak."""
+    model = _tiny_ar()
+    codes = torch.tensor([[10, 11, 12, 0, 0]])
+    attn = torch.tensor([[1, 1, 1, 0, 0]])
+    _x, _mask, _pos, labels, last_idx = model._build_sequence_tensors(
+        codes, attn, None, None, None, None, None, None
+    )
+    assert labels[0, 0].item() == 10
+    assert labels[0, 1].item() == 11
+    assert labels[0, 2].item() == 12
+    assert labels[0, 3].item() == model.eos_token_idx
+    assert _x.shape[1] == 4
+    assert last_idx[0].item() == 3
 
 
 def test_ar_packed_two_segments():
@@ -54,37 +69,46 @@ def test_ar_packed_two_segments():
     attn = torch.tensor([[1, 1, 1, 1, 1, 1, 0, 0]])
     seg_starts = torch.tensor([[0, 3]])
     seg_lengths = torch.tensor([[3, 3]])
-    loss, cls_emb = model(codes, attn, segment_starts=seg_starts, segment_lengths=seg_lengths)
+    loss, summary = model(codes, attn, segment_starts=seg_starts, segment_lengths=seg_lengths)
     assert torch.isfinite(loss)
-    assert cls_emb.shape == (1, 16)
+    assert summary.shape == (1, 16)
 
 
 def test_ar_causal_mask_blocks_cross_segment():
     model = _tiny_ar()
+    # Two segments of 3 events → 4 tokens each (CLS + 3 events)
     boundaries = [0, 4]
-    mask = model._causal_segment_mask(7, boundaries, torch.device("cpu"))
-    # Causal: position 0 cannot attend to future position 3
+    mask = model._causal_segment_mask(8, boundaries, torch.device("cpu"))
     assert mask[0, 3].item() == float("-inf")
-    # Same segment: position 3 can attend to position 0 (past)
     assert mask[3, 0].item() == 0.0
-    # Cross-segment: position 4 (start of seg 2) cannot attend to position 3 (seg 1)
     assert mask[4, 3].item() == float("-inf")
-    assert mask[4, 4].item() == 0.0
+    assert mask[7, 4].item() == 0.0
 
 
-def test_ar_encode_cls_matches_forward_cls():
+def test_ar_last_token_pooling_matches_forward():
     model = _tiny_ar()
     codes = torch.randint(1, 18, (2, 5))
     attn = torch.ones(2, 5, dtype=torch.long)
-    loss, cls_fwd = model(codes, attn)
-    cls_enc = model.encode_cls_embedding(codes, attn)
-    assert torch.allclose(cls_fwd, cls_enc, atol=1e-5)
+    loss, summary_fwd = model(codes, attn)
+    summary_enc = model.encode_last_token_embedding(codes, attn)
+    assert torch.allclose(summary_fwd, summary_enc, atol=1e-5)
+
+
+def test_ar_cls_pooling_uses_last_token():
+    model = _tiny_ar()
+    codes = torch.randint(1, 18, (2, 5))
+    attn = torch.ones(2, 5, dtype=torch.long)
+    last = model.encode_last_token_embedding(codes, attn)
+    cls_mode = model.encode_pooled_embedding(codes, attn, pooling_mode="cls")
+    assert torch.allclose(last, cls_mode, atol=1e-5)
 
 
 if __name__ == "__main__":
     test_ar_forward_finite_loss()
     test_ar_forward_gradient_flow()
+    test_ar_shifted_labels_no_cls_ignore()
     test_ar_packed_two_segments()
     test_ar_causal_mask_blocks_cross_segment()
-    test_ar_encode_cls_matches_forward_cls()
+    test_ar_last_token_pooling_matches_forward()
+    test_ar_cls_pooling_uses_last_token()
     print("test_ar_forward: all passed")

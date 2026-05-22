@@ -3,17 +3,19 @@ Autoregressive (GPT-style) EHR pretraining via next-token prediction.
 
 Architecture
 ------------
-  EventEmbedding  →  [CLS | events | EOS]  →  EHRTransformerEncoder (causal)
-                                                   ↓
-                                           LM head  →  next-token loss
-                                                   ↓
-                                           CLS @ segment start  (downstream)
+  EventEmbedding  →  [CLS | events]  →  EHRTransformerEncoder (causal)
+                                              ↓
+                                      LM head  →  next-token loss
+                                              ↓
+                                      last event hidden  (downstream)
 
-Each trajectory is framed as [CLS | tok_1 … tok_L | EOS].  Packed batches
-concatenate multiple trajectories: [CLS|seq1|EOS|CLS|seq2|EOS|…] with a
-segment-aware causal mask so tokens cannot attend across segment boundaries.
+Input per segment: [CLS, tok_0, …, tok_{T-1}]  (EOS is not fed as input).
+Labels per segment: [tok_0, …, tok_{T-1}, EOS]  — hidden at t predicts label[t].
 
-Forward returns: (ar_loss, cls_embedding)
+Packed batches: [CLS|seq1|CLS|seq2|…] with segment-aware causal masking.
+
+Forward returns: (ar_loss, summary_embedding)  — summary is the last valid input
+position (final event), which has seen the full causal context.
 """
 
 from __future__ import annotations
@@ -126,14 +128,14 @@ class AREHRModel(nn.Module):
         segment_lengths: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Build padded batch of [CLS|events|EOS] per segment, concatenated when packed.
+        Build shifted AR sequences per segment, concatenated when packed.
+
+        Input:  [CLS, event_0, …, event_{T-1}]
+        Labels: [event_0, …, event_{T-1}, EOS]  (aligned: hidden[t] → label[t])
 
         Returns
         -------
-        x, full_mask, position_ids, labels, segment_cls_indices
-            x: (B, T_max, d_model)
-            labels: (B, T_max) with -100 at non-predicted positions
-            segment_cls_indices: (B,) index of first CLS per row (for downstream)
+        x, full_mask, position_ids, labels, last_valid_indices
         """
         B = codes.shape[0]
         device = codes.device
@@ -144,7 +146,6 @@ class AREHRModel(nn.Module):
         rows_mask: List[torch.Tensor] = []
         rows_pos: List[torch.Tensor] = []
         rows_lab: List[torch.Tensor] = []
-        cls_indices: List[int] = []
 
         for b in range(B):
             parts_emb: List[torch.Tensor] = []
@@ -152,16 +153,18 @@ class AREHRModel(nn.Module):
             parts_pos: List[int] = []
             parts_lab: List[int] = []
 
-            first_cls_idx = 0
-
-            for seg_i, (start, length) in enumerate(seg_meta[b]):
+            for _seg_i, (start, length) in enumerate(seg_meta[b]):
                 ev_codes = codes[b, start : start + length]
                 ev_mask = attention_mask[b, start : start + length]
+                seg_len = int(ev_mask.sum().item())
+                if seg_len == 0:
+                    continue
 
-                ev_vals = values[b, start : start + length] if values is not None else None
-                ev_z = z_scores[b, start : start + length] if z_scores is not None else None
-                ev_dt = delta_times[b, start : start + length] if delta_times is not None else None
-                ev_vm = value_mask[b, start : start + length] if value_mask is not None else None
+                ev_codes = ev_codes[:seg_len]
+                ev_vals = values[b, start : start + seg_len] if values is not None else None
+                ev_z = z_scores[b, start : start + seg_len] if z_scores is not None else None
+                ev_dt = delta_times[b, start : start + seg_len] if delta_times is not None else None
+                ev_vm = value_mask[b, start : start + seg_len] if value_mask is not None else None
 
                 ev_emb = self.embedding(
                     ev_codes.unsqueeze(0),
@@ -172,19 +175,17 @@ class AREHRModel(nn.Module):
                 ).squeeze(0)
 
                 cls = self.cls_token.unsqueeze(0)
-                eos = self.eos_token.unsqueeze(0)
-                seg_emb = torch.cat([cls, ev_emb, eos], dim=0)
+                # INPUT: [CLS, event_0, …, event_{T-1}] — no EOS in the input
+                seg_emb = torch.cat([cls, ev_emb], dim=0)
 
                 parts_emb.append(seg_emb)
-                seg_len = int(ev_mask.sum().item())
-                parts_mask.extend([1] * (1 + seg_len + 1))
+                parts_mask.extend([1] * (seg_len + 1))
 
                 pos_base = 0
-                parts_pos.extend(range(pos_base, pos_base + 1 + seg_len + 1))
+                parts_pos.extend(range(pos_base, pos_base + seg_len + 1))
 
-                labs = [-100]
-                for t in range(seg_len):
-                    labs.append(int(ev_codes[t].item()))
+                # LABELS: [event_0, …, event_{T-1}, EOS]
+                labs = [int(ev_codes[t].item()) for t in range(seg_len)]
                 labs.append(self.eos_token_idx)
                 parts_lab.extend(labs)
 
@@ -195,12 +196,10 @@ class AREHRModel(nn.Module):
                 parts_lab.append(-100)
 
             row_x = torch.cat(parts_emb, dim=0)
-            T = row_x.shape[0]
             rows_x.append(row_x)
             rows_mask.append(torch.tensor(parts_mask, device=device, dtype=torch.long))
             rows_pos.append(torch.tensor(parts_pos, device=device, dtype=torch.long))
             rows_lab.append(torch.tensor(parts_lab, device=device, dtype=torch.long))
-            cls_indices.append(first_cls_idx)
 
         T_max = max(r.shape[0] for r in rows_x)
         x = torch.zeros(B, T_max, d_model, device=device)
@@ -215,8 +214,13 @@ class AREHRModel(nn.Module):
             position_ids[b, :t] = rows_pos[b]
             labels[b, :t] = rows_lab[b]
 
-        cls_idx = torch.tensor(cls_indices, device=device, dtype=torch.long)
-        return x, full_mask, position_ids, labels, cls_idx
+        last_idx = self._last_valid_indices(full_mask)
+        return x, full_mask, position_ids, labels, last_idx
+
+    @staticmethod
+    def _last_valid_indices(full_mask: torch.Tensor) -> torch.Tensor:
+        """(B,) index of the last real input token (final event, not EOS)."""
+        return full_mask.sum(dim=1).long() - 1
 
     def _causal_segment_mask(self, T: int, seg_boundaries: List[int], device: torch.device) -> torch.Tensor:
         """
@@ -243,8 +247,8 @@ class AREHRModel(nn.Module):
         segment_starts: Optional[torch.Tensor] = None,
         segment_lengths: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Returns (h, labels, full_mask, cls_indices)."""
-        x, full_mask, position_ids, labels, cls_idx = self._build_sequence_tensors(
+        """Returns (h, labels, full_mask, last_valid_indices)."""
+        x, full_mask, position_ids, labels, last_idx = self._build_sequence_tensors(
             codes,
             attention_mask,
             values,
@@ -260,13 +264,20 @@ class AREHRModel(nn.Module):
         attn_biases = []
         seg_meta = self._segment_metadata(attention_mask, segment_starts, segment_lengths)
         for b in range(B):
-            boundaries = [0]
+            boundaries: List[int] = []
             offset = 0
             for _start, length in seg_meta[b]:
-                boundaries.append(offset + 1 + length + 1)
-                offset = boundaries[-1]
+                seg_len = int(
+                    attention_mask[b, _start : _start + length].sum().item()
+                )
+                if seg_len == 0:
+                    continue
+                boundaries.append(offset)
+                offset += 1 + seg_len
+            if not boundaries:
+                boundaries = [0]
             t_b = int(full_mask[b].sum().item())
-            attn_biases.append(self._causal_segment_mask(t_b, boundaries[:-1], device))
+            attn_biases.append(self._causal_segment_mask(t_b, boundaries, device))
 
         T_max = x.shape[1]
         batch_bias = torch.full((B, T_max, T_max), float("-inf"), device=device)
@@ -280,7 +291,23 @@ class AREHRModel(nn.Module):
             position_ids=position_ids,
             attn_bias=batch_bias,
         )
-        return h, labels, full_mask, cls_idx
+        return h, labels, full_mask, last_idx
+
+    def encode_last_token_embedding(
+        self,
+        codes: torch.Tensor,
+        attention_mask: torch.Tensor,
+        values: Optional[torch.Tensor] = None,
+        z_scores: Optional[torch.Tensor] = None,
+        delta_times: Optional[torch.Tensor] = None,
+        value_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Final event hidden state (full causal context; use for downstream)."""
+        h, _labels, _mask, last_idx = self._encode(
+            codes, attention_mask, values, z_scores, delta_times, value_mask
+        )
+        batch_idx = torch.arange(h.shape[0], device=h.device)
+        return h[batch_idx, last_idx, :]
 
     def encode_cls_embedding(
         self,
@@ -291,10 +318,10 @@ class AREHRModel(nn.Module):
         delta_times: Optional[torch.Tensor] = None,
         value_mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        h, _labels, _mask, cls_idx = self._encode(
+        """Alias for ``encode_last_token_embedding`` (CLS is not used for AR pooling)."""
+        return self.encode_last_token_embedding(
             codes, attention_mask, values, z_scores, delta_times, value_mask
         )
-        return h[torch.arange(h.shape[0], device=h.device), cls_idx, :]
 
     def encode_pooled_embedding(
         self,
@@ -309,20 +336,21 @@ class AREHRModel(nn.Module):
         from models.sequence_pooling import mean_pool_sequence, parse_pooling_mode
 
         mode = parse_pooling_mode(pooling_mode)
-        h, _labels, full_mask, cls_idx = self._encode(
+        h, _labels, full_mask, last_idx = self._encode(
             codes, attention_mask, values, z_scores, delta_times, value_mask
         )
+        batch_idx = torch.arange(h.shape[0], device=h.device)
+        # Causal AR: position 0 (CLS) sees no history — use last event, not CLS.
         if mode == "cls":
-            return h[torch.arange(h.shape[0], device=h.device), cls_idx, :]
+            return h[batch_idx, last_idx, :]
 
         B = h.shape[0]
         event_h = []
         event_m = []
         for b in range(B):
-            cls_pos = int(cls_idx[b].item())
             t = int(full_mask[b].sum().item())
-            event_h.append(h[b, cls_pos + 1 : t - 1, :])
-            event_m.append(full_mask[b, cls_pos + 1 : t - 1])
+            event_h.append(h[b, 1:t, :])
+            event_m.append(full_mask[b, 1:t])
         max_e = max(e.shape[0] for e in event_h)
         d = h.shape[-1]
         pooled_h = torch.zeros(B, max_e, d, device=h.device)
@@ -344,7 +372,7 @@ class AREHRModel(nn.Module):
         segment_starts: Optional[torch.Tensor] = None,
         segment_lengths: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        h, labels, _mask, cls_idx = self._encode(
+        h, labels, _mask, last_idx = self._encode(
             codes,
             attention_mask,
             values,
@@ -360,8 +388,9 @@ class AREHRModel(nn.Module):
             labels.view(-1),
             ignore_index=-100,
         )
-        cls_embedding = h[torch.arange(h.shape[0], device=h.device), cls_idx, :]
-        return ar_loss, cls_embedding
+        batch_idx = torch.arange(h.shape[0], device=h.device)
+        summary_embedding = h[batch_idx, last_idx, :]
+        return ar_loss, summary_embedding
 
 
 class ARTrainer(nn.Module):

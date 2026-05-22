@@ -153,4 +153,3 @@ def test_ar_supervised_forward_backward():
     loss = torch.nn.functional.binary_cross_entropy_with_logits(logits, labels)
     loss.backward()
     assert ar.cls_token.grad is not None
-    assert ar.eos_token.grad is not None

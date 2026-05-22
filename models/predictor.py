@@ -66,6 +66,38 @@ class TemporalSpanPrompt(nn.Module):
         return self.mlp(span_coords)
 
 
+class HoursSinceFirstEmbedding(nn.Module):
+    """
+    Additive d_model bias from wall-clock hours since the first event in the window.
+
+    Used in Branch B (token predictor): added to CLS / context / MASK inputs before
+    the shallow transformer.  RoPE still uses sequence position_ids separately.
+    Input is log1p(hours) for scale stability.
+    """
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, hours: torch.Tensor) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        hours:
+            FloatTensor of any shape ending in (...) — hours since window start (>= 0).
+
+        Returns
+        -------
+        FloatTensor (..., d_model) additive vectors.
+        """
+        h = torch.log1p(hours.clamp(min=0).float()).unsqueeze(-1)
+        return self.mlp(h)
+
+
 class Predictor(nn.Module):
     """
     Shallow Transformer predictor conditioned on temporal span prompts.

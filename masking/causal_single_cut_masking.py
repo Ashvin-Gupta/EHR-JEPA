@@ -21,7 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
-from masking.causal_future_masking import _real_positions, _span_midpoint_duration
+from masking.causal_future_masking import _real_positions
 from masking.span_masking import SpanMaskResult
 
 
@@ -117,14 +117,13 @@ class CausalSingleCutMasker:
         if len(context_indices) < self.min_context_events or len(tgt) < self.min_target_events:
             return empty
 
-        st = _span_midpoint_duration(tgt, times_hours)
         t_cut_h = times_hours[t_chosen]
         delta_min = [(times_hours[p] - t_cut_h) * 60.0 for p in tgt]
 
         return SpanMaskResult(
             context_indices=context_indices,
             target_spans=[tgt],
-            span_times=[st],
+            span_times=[],
             target_token_delta_minutes=[delta_min],
             cutpoint_index=t_chosen,
             context_start_index=s_chosen,

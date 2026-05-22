@@ -1,6 +1,10 @@
 """
 FrozenAREncoder — frozen AR backbone feature extractor for linear probing.
 
+Returns the last-event hidden state (full causal context). Config ``pooling: cls``
+is mapped to last-token pooling for causal models; ``mean_pool`` averages event
+positions (excluding the leading CLS input).
+
 Interface matches FrozenBERTEncoder / FrozenEHREncoder:
     (codes, attention_mask, ...) → (B, d_model)
 """

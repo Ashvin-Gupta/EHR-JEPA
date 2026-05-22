@@ -24,7 +24,7 @@ def test_single_span_output_shape():
     L = 80
     r = m(seq_len=L, attention_mask=[1] * L, times_hours=_hours_linear(L))
     assert len(r.target_spans) == 1
-    assert len(r.span_times) == 1
+    assert r.span_times == []
 
 
 def test_no_future_in_context():

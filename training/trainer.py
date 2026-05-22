@@ -21,7 +21,7 @@ Two predictor branches, controlled by TrainerConfig.use_perceiver:
     Target pathway: [CLS | full sequence] → encoder → Y_tgt at target positions.
     Context pathway: target tokens dropped → compact context → encoder.
     Predictor input: full-length (B, L, d) with context encodings at context
-    indices and learnable MASK (+ temporal prompt) at target indices.
+    indices and learnable MASK (+ hours-since-first time bias) at target indices.
     Token predictor → (B, L, d); slice target positions → Y_hat.
     Optional ProjectionHead on Y_hat / Y_tgt (when use_proj_head).
     Loss: MSE(Y_hat_proj, Y_tgt_proj.detach()) + λ·CovReg(Y_tgt_proj)
@@ -56,7 +56,7 @@ from masking.span_masking import SpanMasker
 from models.cls_encoding import encode_embeddings_with_cls
 from models.event_embedding import EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
-from models.predictor import Predictor, TemporalSpanPrompt
+from models.predictor import HoursSinceFirstEmbedding, Predictor, TemporalSpanPrompt
 from models.projection_head import ProjectionHead
 from models.attention_masks import build_causal_single_quadrant_mask_batch
 from models.transformer_encoder import EHRTransformerEncoder
@@ -276,7 +276,9 @@ class JEPATrainer(nn.Module):
         Single shared EHRTransformerEncoder — used for BOTH target and context
         pathways (same weight tensor, two forward passes per batch).
     prompt:
-        TemporalSpanPrompt (used by both branches).
+        TemporalSpanPrompt (Branch A / Perceiver only).
+    time_embed:
+        HoursSinceFirstEmbedding — additive wall-clock bias in token predictor (Branch B).
     predictor:
         Shallow Predictor transformer operating on latent tokens (Branch A).
     token_predictor:
@@ -298,6 +300,7 @@ class JEPATrainer(nn.Module):
         embedding: EventEmbedding,
         encoder: EHRTransformerEncoder,
         prompt: TemporalSpanPrompt,
+        time_embed: HoursSinceFirstEmbedding,
         predictor: Predictor,
         token_predictor: EHRTransformerEncoder,
         context_pooler: Optional[LatentCrossAttentionPool],
@@ -310,6 +313,7 @@ class JEPATrainer(nn.Module):
         self.embedding = embedding
         self.encoder = encoder
         self.prompt = prompt
+        self.time_embed = time_embed
         self.predictor = predictor
         self.token_predictor = token_predictor
         self.context_pooler = context_pooler
@@ -360,6 +364,7 @@ class JEPATrainer(nn.Module):
         z_scores: Optional[torch.Tensor] = None,
         delta_times: Optional[torch.Tensor] = None,
         value_mask: Optional[torch.Tensor] = None,
+        hours_since_first: Optional[torch.Tensor] = None,
         pre_mask: Optional[Dict] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -371,6 +376,9 @@ class JEPATrainer(nn.Module):
         z_scores:        FloatTensor (B, L) | None
         delta_times:     FloatTensor (B, L) | None
         value_mask:      LongTensor  (B, L) | None
+        hours_since_first:
+                         FloatTensor (B, L) | None — hours since first window event;
+                         used by Branch B token predictor (additive, on top of RoPE).
         pre_mask:        Span or causal dict from MEDSCollator, or None.
                          Span keys: mask_context_indices, mask_target_spans,
                          mask_span_times.  Causal keys: mask_causal_contexts,
@@ -420,10 +428,20 @@ class JEPATrainer(nn.Module):
         if delta_times is not None and x_real.numel() > 0:
             _std_times = x_real.detach().float().std().item()
 
+        if hours_since_first is None:
+            hours_since_first = torch.arange(
+                L, device=device, dtype=torch.float
+            ).unsqueeze(0).expand(B, -1)
+
         if pre_mask is not None and "mask_causal_contexts" in pre_mask:
             return self._forward_causal_multi_cut(
-                x, attention_mask, pre_mask, device,
-                _std_values, _std_times,
+                x,
+                attention_mask,
+                pre_mask,
+                device,
+                hours_since_first,
+                _std_values,
+                _std_times,
             )
 
         # 2. Span masking — use pre-computed results from the DataLoader worker
@@ -434,7 +452,12 @@ class JEPATrainer(nn.Module):
         if pre_mask is not None:
             all_context_indices = pre_mask["mask_context_indices"]
             all_target_spans = pre_mask["mask_target_spans"]
-            all_span_times = pre_mask["mask_span_times"]
+            all_span_times = pre_mask.get("mask_span_times")
+            if all_span_times is None:
+                all_span_times = [
+                    [(0.0, 0.0)] * max(len(all_target_spans[b]), 1)
+                    for b in range(len(all_target_spans))
+                ]
             all_target_delta_minutes = pre_mask.get("mask_target_delta_minutes")
             mask_cutpoints = pre_mask.get("mask_cutpoint_indices")
             mask_context_starts = pre_mask.get("mask_context_start_indices")
@@ -551,13 +574,18 @@ class JEPATrainer(nn.Module):
                     ctx_mask,
                     target_spans_list,
                     all_target_spans,
-                    all_span_times,
+                    hours_since_first,
                     all_target_delta_minutes=all_target_delta_minutes,
                 )
             else:
                 l_pred, l_cov = self._forward_token(
-                    context_enc_out, ctx_pos_ids, ctx_mask,
-                    target_spans_list, all_target_spans, all_span_times, L,
+                    context_enc_out,
+                    ctx_pos_ids,
+                    ctx_mask,
+                    target_spans_list,
+                    all_target_spans,
+                    hours_since_first,
+                    L,
                     all_target_delta_minutes=all_target_delta_minutes,
                 )
 
@@ -628,6 +656,7 @@ class JEPATrainer(nn.Module):
         attention_mask: torch.Tensor,
         pre_mask: Dict,
         device: torch.device,
+        hours_since_first: torch.Tensor,
         _std_values: float,
         _std_times: float,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -698,13 +727,14 @@ class JEPATrainer(nn.Module):
                     all_span_times,
                 )
             else:
+                h_sub = hours_since_first[valid_bs]
                 l_p, l_c = self._forward_token(
                     context_enc_out,
                     ctx_pos_ids,
                     ctx_mask,
                     target_spans_list,
                     all_target_spans,
-                    all_span_times,
+                    h_sub,
                     x_sub.shape[1],
                 )
             pred_losses.append(l_p)
@@ -980,31 +1010,44 @@ class JEPATrainer(nn.Module):
                 idx[b, :n] = torch.tensor(span[:n], dtype=torch.long, device=device)
         return idx
 
+    def _add_time_bias_to_context_scatter(
+        self,
+        x_full: torch.Tensor,
+        ctx_pos_ids: torch.Tensor,
+        ctx_mask: torch.Tensor,
+        hours_since_first: torch.Tensor,
+    ) -> None:
+        """Add hours-since-first bias to scattered context encodings (in-place)."""
+        B, nc_max = ctx_pos_ids.shape
+        for b in range(B):
+            nc = int(ctx_mask[b].sum().item())
+            if nc == 0:
+                continue
+            pos = ctx_pos_ids[b, :nc]
+            h = hours_since_first[b, pos]
+            x_full[b, pos] = x_full[b, pos] + self.time_embed(h)
+
     def _place_mask_tokens_at_span(
         self,
         x_full: torch.Tensor,
         attn_full: torch.Tensor,
         all_target_spans: List[List[List[int]]],
         span_idx: int,
-        span_prompt: torch.Tensor,
+        hours_since_first: torch.Tensor,
         max_span_len: int,
     ) -> None:
-        """Write learnable MASK (+ temporal prompt) at target indices (in-place)."""
+        """Write learnable MASK (+ per-position hours-since-first bias) at targets."""
         B = x_full.shape[0]
-        idx = self._span_index_tensor(
-            all_target_spans, span_idx, max_span_len, x_full.device
-        )
-        mask_rows = self.mask_token + span_prompt[:, 0, :]
         for b in range(B):
             span = all_target_spans[b][span_idx]
             n = min(len(span), max_span_len)
             if n == 0:
                 continue
-            pos = idx[b, :n]
-            x_full[b].index_copy_(0, pos, mask_rows[b].unsqueeze(0).expand(n, -1))
-            attn_full[b].index_copy_(
-                0, pos, torch.ones(n, dtype=torch.long, device=x_full.device)
-            )
+            for j in range(n):
+                p = span[j]
+                h = hours_since_first[b, p]
+                x_full[b, p] = self.mask_token + self.time_embed(h)
+                attn_full[b, p] = 1
 
     def _extract_span_outputs(
         self,
@@ -1057,7 +1100,7 @@ class JEPATrainer(nn.Module):
         ctx_mask: torch.Tensor,
         target_spans_list: List[torch.Tensor],
         all_target_spans: List[List[List[int]]],
-        all_span_times: List[List[Tuple[float, float]]],
+        hours_since_first: torch.Tensor,
         all_target_delta_minutes: Optional[List[List[List[float]]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -1065,7 +1108,8 @@ class JEPATrainer(nn.Module):
 
         Target encoder runs on the full sequence (y_tgt).  Context prefix is
         re-encoded; pretrained CLS + learnable MASK tokens (RoPE at event
-        positions; CLS at position 0) feed the token predictor.  Quadrant
+        positions; CLS at position 0; + hours-since-first additive bias) feed
+        the token predictor.  Quadrant
         attention: CLS/context cannot attend to MASK slots; MASK slots may
         attend to CLS and context.  Only batch rows with non-empty context
         and enough target tokens are included.
@@ -1106,11 +1150,17 @@ class JEPATrainer(nn.Module):
         pos_cat = torch.zeros(B_eff, max_compact, dtype=torch.long, device=device)
         attn_cat = torch.zeros(B_eff, max_compact, dtype=torch.long, device=device)
 
-        coords = self._span_coords_for_span(all_span_times, span_idx, device)
-        span_prompt = self.prompt(coords.unsqueeze(1))  # (B, 1, d)
-
         for bi, b in enumerate(valid_bs):
             nc, nt = lengths_c[b], lengths_t[b]
+            compact_len = 1 + nc + nt
+            hours_slots = torch.zeros(compact_len, device=device, dtype=torch.float)
+            hours_slots[0] = 0.0
+            if nc > 0:
+                hours_slots[1 : 1 + nc] = hours_since_first[b, ctx_pos_ids[b, :nc]]
+            tgt_idx = all_target_spans[b][span_idx]
+            for j, p in enumerate(tgt_idx[:nt]):
+                hours_slots[1 + nc + j] = hours_since_first[b, p]
+
             x_cat[bi, 0] = self.cls_token
             pos_cat[bi, 0] = 0
             attn_cat[bi, 0] = 1
@@ -1118,12 +1168,14 @@ class JEPATrainer(nn.Module):
                 x_cat[bi, 1 : 1 + nc] = context_enc_out[b, :nc]
                 pos_cat[bi, 1 : 1 + nc] = ctx_pos_ids[b, :nc]
                 attn_cat[bi, 1 : 1 + nc] = 1
-            mask_vec = self.mask_token + span_prompt[b, 0, :]
-            tgt_idx = all_target_spans[b][span_idx]
-            for j, p in enumerate(tgt_idx[:nt]):
-                x_cat[bi, 1 + nc + j] = mask_vec
-                pos_cat[bi, 1 + nc + j] = int(p)
+            for j in range(nt):
+                p = int(tgt_idx[j])
+                x_cat[bi, 1 + nc + j] = self.mask_token
+                pos_cat[bi, 1 + nc + j] = p
                 attn_cat[bi, 1 + nc + j] = 1
+            x_cat[bi, :compact_len] = x_cat[bi, :compact_len] + self.time_embed(
+                hours_slots
+            )
 
         if not torch.isfinite(x_cat).all():
             z = _zero_loss_connected(context_enc_out)
@@ -1210,14 +1262,14 @@ class JEPATrainer(nn.Module):
         ctx_mask: torch.Tensor,
         target_spans_list: List[torch.Tensor],
         all_target_spans: List[List[List[int]]],
-        all_span_times: List[List[Tuple[float, float]]],
+        hours_since_first: torch.Tensor,
         seq_len: int,
         all_target_delta_minutes: Optional[List[List[List[float]]]] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         For each span (span_budget etc.):
           - Scatter context encodings to context indices in (B, L, d)
-          - Place MASK tokens at target indices (learnable token + temporal prompt)
+          - Place MASK tokens at target indices (learnable token + hours-since-first bias)
           - Token predictor on full length L with original RoPE positions
           - Slice outputs at target indices → Y_hat; L_pred vs Y_tgt
         Returns averaged (l_pred, l_cov).
@@ -1233,15 +1285,17 @@ class JEPATrainer(nn.Module):
         )
         pos_ids = torch.arange(seq_len, device=device).unsqueeze(0).expand(B, -1)
 
+        self._add_time_bias_to_context_scatter(
+            x_ctx_full, ctx_pos_ids, ctx_mask, hours_since_first
+        )
+
         for s, y_tgt in enumerate(target_spans_list):
             N_span = y_tgt.shape[1]
-            coords = self._span_coords_for_span(all_span_times, s, device)
-            span_prompt = self.prompt(coords.unsqueeze(1))  # (B, 1, d)
 
             x_in = x_ctx_full.clone()
             attn_in = ctx_attn.clone()
             self._place_mask_tokens_at_span(
-                x_in, attn_in, all_target_spans, s, span_prompt, N_span
+                x_in, attn_in, all_target_spans, s, hours_since_first, N_span
             )
 
             out = self.token_predictor(
@@ -1692,11 +1746,14 @@ class JEPATrainer(nn.Module):
                 z_scores    = batch.get("z_scores")
                 delta_times = batch.get("delta_times")
                 value_mask  = batch.get("value_mask")
+                hours_since_first = batch.get("hours_since_first")
 
                 if values      is not None: values      = values.to(device, non_blocking=True)
                 if z_scores    is not None: z_scores    = z_scores.to(device, non_blocking=True)
                 if delta_times is not None: delta_times = delta_times.to(device, non_blocking=True)
                 if value_mask  is not None: value_mask  = value_mask.to(device, non_blocking=True)
+                if hours_since_first is not None:
+                    hours_since_first = hours_since_first.to(device, non_blocking=True)
 
                 # Pre-computed masking from the DataLoader worker (plain Python
                 # lists — they stay on CPU, never move to device).
@@ -1709,7 +1766,13 @@ class JEPATrainer(nn.Module):
 
                 optimizer.zero_grad()
                 l_pred, l_cov, l_total = _forward(
-                    codes, attn_mask, values, z_scores, delta_times, value_mask,
+                    codes,
+                    attn_mask,
+                    values,
+                    z_scores,
+                    delta_times,
+                    value_mask,
+                    hours_since_first=hours_since_first,
                     pre_mask=pre_mask,
                 )
                 if is_main_process and not (
@@ -2012,14 +2075,23 @@ class JEPATrainer(nn.Module):
                 z_scores    = batch.get("z_scores")
                 delta_times = batch.get("delta_times")
                 value_mask  = batch.get("value_mask")
+                hours_since_first = batch.get("hours_since_first")
                 if values      is not None: values      = values.to(device, non_blocking=True)
                 if z_scores    is not None: z_scores    = z_scores.to(device, non_blocking=True)
                 if delta_times is not None: delta_times = delta_times.to(device, non_blocking=True)
                 if value_mask  is not None: value_mask  = value_mask.to(device, non_blocking=True)
+                if hours_since_first is not None:
+                    hours_since_first = hours_since_first.to(device, non_blocking=True)
                 pre_mask = _pre_mask_dict_from_batch(batch)
 
                 _, _, l_total = self.forward(
-                    codes, attn_mask, values, z_scores, delta_times, value_mask,
+                    codes,
+                    attn_mask,
+                    values,
+                    z_scores,
+                    delta_times,
+                    value_mask,
+                    hours_since_first=hours_since_first,
                     pre_mask=pre_mask,
                 )
                 total += l_total.item()

@@ -15,7 +15,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from loss.covariance_reg import SIGRegLoss
 from masking.span_masking import SpanMasker
 from models.event_embedding import EmbeddingConfig, EventEmbedding
-from models.predictor import Predictor, TemporalSpanPrompt
+from models.predictor import HoursSinceFirstEmbedding, Predictor, TemporalSpanPrompt
 from models.transformer_encoder import EHRTransformerEncoder, TransformerEncoderConfig
 from training.trainer import JEPATrainer, TrainerConfig
 
@@ -64,6 +64,7 @@ def _build_trainer(
         embedding=embedding,
         encoder=encoder,
         prompt=TemporalSpanPrompt(D),
+        time_embed=HoursSinceFirstEmbedding(D),
         predictor=Predictor(D, n_heads=4, n_layers=2, dropout=0.0),
         token_predictor=token_predictor,
         context_pooler=None,
@@ -191,6 +192,7 @@ def test_causal_single_cuda_large_batch():
         embedding=embedding,
         encoder=EHRTransformerEncoder(enc_cfg),
         prompt=TemporalSpanPrompt(D_prod),
+        time_embed=HoursSinceFirstEmbedding(D_prod),
         predictor=Predictor(D_prod, n_heads=8, n_layers=2, dropout=0.0),
         token_predictor=EHRTransformerEncoder(enc_cfg),
         context_pooler=None,

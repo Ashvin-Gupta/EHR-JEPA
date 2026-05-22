@@ -75,7 +75,7 @@ from masking.causal_single_cut_masking import CausalSingleCutMasker
 from masking.span_masking import SpanMasker
 from models.event_embedding import EmbeddingConfig, EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
-from models.predictor import Predictor, TemporalSpanPrompt
+from models.predictor import HoursSinceFirstEmbedding, Predictor, TemporalSpanPrompt
 from models.transformer_encoder import EHRTransformerEncoder, TransformerEncoderConfig
 from training.trainer import JEPATrainer, TrainerConfig
 from evaluation.downstream_dataset import DownstreamDataset
@@ -201,7 +201,8 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
         dropout=t.get("dropout", 0.1),
     ))
 
-    prompt   = TemporalSpanPrompt(d_model)
+    prompt     = TemporalSpanPrompt(d_model)
+    time_embed = HoursSinceFirstEmbedding(d_model)
     cov_loss = SIGRegLoss(num_slices=lc.get("sigreg_num_slices", 32))
     if mask_strategy == "causal_future":
         min_tgt_ev = int(
@@ -306,6 +307,7 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
         embedding=embedding,
         encoder=encoder,
         prompt=prompt,
+        time_embed=time_embed,
         predictor=predictor,
         token_predictor=token_predictor,
         context_pooler=context_pooler,

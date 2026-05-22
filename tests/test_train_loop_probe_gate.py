@@ -10,7 +10,7 @@ from loss.covariance_reg import SIGRegLoss
 from masking.span_masking import SpanMasker
 from models.event_embedding import EmbeddingConfig, EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
-from models.predictor import Predictor, TemporalSpanPrompt
+from models.predictor import HoursSinceFirstEmbedding, Predictor, TemporalSpanPrompt
 from models.transformer_encoder import EHRTransformerEncoder, TransformerEncoderConfig
 from training.trainer import JEPATrainer, TrainerConfig
 
@@ -31,6 +31,7 @@ def _tiny_trainer() -> JEPATrainer:
         TransformerEncoderConfig(n_layers=1, d_model=D, n_heads=2, ffn_dim=32, dropout=0.0)
     )
     prompt = TemporalSpanPrompt(D)
+    time_embed = HoursSinceFirstEmbedding(D)
     pred = Predictor(D, n_heads=2, n_layers=1, dropout=0.0)
     tok = EHRTransformerEncoder(
         TransformerEncoderConfig(n_layers=1, d_model=D, n_heads=2, ffn_dim=32, dropout=0.0)
@@ -51,6 +52,7 @@ def _tiny_trainer() -> JEPATrainer:
         embedding=emb,
         encoder=enc,
         prompt=prompt,
+        time_embed=time_embed,
         predictor=pred,
         token_predictor=tok,
         context_pooler=pool,

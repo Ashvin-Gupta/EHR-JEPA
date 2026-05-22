@@ -20,7 +20,7 @@ from loss.covariance_reg import SIGRegLoss
 from masking.span_masking import SpanMasker
 from models.event_embedding import EmbeddingConfig, EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
-from models.predictor import Predictor, TemporalSpanPrompt
+from models.predictor import HoursSinceFirstEmbedding, Predictor, TemporalSpanPrompt
 from models.transformer_encoder import EHRTransformerEncoder, TransformerEncoderConfig
 from training.trainer import JEPATrainer, TrainerConfig
 
@@ -70,6 +70,7 @@ def _build_trainer(
     encoder = _build_encoder()
 
     prompt         = TemporalSpanPrompt(D)
+    time_embed     = HoursSinceFirstEmbedding(D)
     predictor      = Predictor(D, n_heads=4, n_layers=2, dropout=0.0)
     token_predictor = _build_encoder(n_layers=2)
     cov_loss       = SIGRegLoss(num_slices=16)
@@ -102,6 +103,7 @@ def _build_trainer(
         embedding=embedding,
         encoder=encoder,
         prompt=prompt,
+        time_embed=time_embed,
         predictor=predictor,
         token_predictor=token_predictor,
         context_pooler=context_pooler,
@@ -571,8 +573,8 @@ def test_target_perceiver_pad_mask_ignored():
     assert torch.allclose(z_real, z_b, atol=1e-5)
 
 
-def test_causal_single_temporal_prompt_affects_loss():
-    """Non-zero mask_span_times must change loss and train TemporalSpanPrompt."""
+def test_causal_single_hours_since_first_affects_loss():
+    """Per-token hours_since_first must change loss and train HoursSinceFirstEmbedding."""
     trainer = _build_trainer(
         use_perceiver=False,
         masking_strategy="causal_single",
@@ -584,19 +586,19 @@ def test_causal_single_temporal_prompt_affects_loss():
     cut = 14
     ctx = list(range(0, cut + 1))
     tgt = list(range(cut + 1, cut + 28))
-    base = {
+    pre = {
         "mask_context_indices": [ctx, ctx],
         "mask_target_spans": [[tgt], [tgt]],
     }
-    pre_zero = {**base, "mask_span_times": [[(0.0, 0.0)], [(0.0, 0.0)]]}
-    pre_nz = {**base, "mask_span_times": [[(5.0, 10.0)], [(8.0, 12.0)]]}
-    l0, _, t0 = trainer(codes, attn, pre_mask=pre_zero)
-    l1, _, t1 = trainer(codes, attn, pre_mask=pre_nz)
+    h_zero = torch.zeros(2, L)
+    h_nz = torch.linspace(0.0, 10.0, L).unsqueeze(0).expand(2, -1)
+    l0, _, t0 = trainer(codes, attn, hours_since_first=h_zero, pre_mask=pre)
+    l1, _, t1 = trainer(codes, attn, hours_since_first=h_nz, pre_mask=pre)
     assert torch.isfinite(t0) and torch.isfinite(t1)
     assert l0.item() != l1.item()
     t1.backward()
-    assert trainer.prompt.mlp[0].weight.grad is not None
-    assert trainer.prompt.mlp[0].weight.grad.norm().item() > 0
+    assert trainer.time_embed.mlp[0].weight.grad is not None
+    assert trainer.time_embed.mlp[0].weight.grad.norm().item() > 0
 
 
 def test_shared_encoder_weights():

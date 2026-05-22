@@ -284,14 +284,15 @@ def test_run_inline_probe():
     from training.trainer import JEPATrainer, TrainerConfig
     from loss.covariance_reg import SIGRegLoss
     from masking.span_masking import SpanMasker
-    from models.predictor import Predictor, TemporalSpanPrompt
+    from models.predictor import HoursSinceFirstEmbedding, Predictor, TemporalSpanPrompt
 
     d = D
     encoder  = _make_encoder()
     token_predictor = _make_encoder()
     pooler   = _make_pooler()
-    prompt   = TemporalSpanPrompt(d)
-    pred     = Predictor(d, n_heads=4, n_layers=1)
+    prompt     = TemporalSpanPrompt(d)
+    time_embed = HoursSinceFirstEmbedding(d)
+    pred       = Predictor(d, n_heads=4, n_layers=1)
     cov_loss = SIGRegLoss(num_slices=8)
     masker   = SpanMasker(mask_ratio=0.3, default_num_spans=2, min_span_length=3)
 
@@ -299,6 +300,7 @@ def test_run_inline_probe():
         embedding=_make_embedding(),
         encoder=encoder,
         prompt=prompt,
+        time_embed=time_embed,
         predictor=pred,
         token_predictor=token_predictor,
         context_pooler=pooler,

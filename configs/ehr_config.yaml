@@ -121,6 +121,8 @@ predictor:
   #   bidirectional — full self-attention among real tokens (default)
   #   quadrant — CLS/context cannot attend to MASK slots; MASK→CLS+context allowed;
   #              context↔context full; target↔target diagonal only
+  # Branch B time: per-token hours_since_first (from collator) → HoursSinceFirstEmbedding
+  #   added to predictor inputs (on top of RoPE position_ids). No span midpoint/duration.
   causal_single_attn: quadrant
   # Add a Linear + BatchNorm1d projection head after the target perceiver and
   # predictor outputs.  Breaks the LN unit-sphere constraint and gives the

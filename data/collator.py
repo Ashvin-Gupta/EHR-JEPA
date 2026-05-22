@@ -23,6 +23,7 @@ Output batch dict (all LongTensor or FloatTensor, shape [B, L]):
     "value_mask":     LongTensor  [B, max_len]   — 1 if value present, 0 if not
     "z_scores":       FloatTensor [B, max_len]   — z-scored values (0.0 if missing)
     "delta_times":    FloatTensor [B, max_len]   — log(1 + hours_since_prev)
+    "hours_since_first": FloatTensor [B, max_len] — hours since first event in window
     "labels":         LongTensor  [B]
     "subject_ids":    LongTensor  [B]
 
@@ -169,6 +170,7 @@ class MEDSCollator:
         all_value_masks: List[torch.Tensor] = []
         all_z_scores: List[torch.Tensor] = []
         all_delta_times: List[torch.Tensor] = []
+        all_hours_since_first: List[torch.Tensor] = []
         labels: List[int] = []
         subject_ids: List[int] = []
         orig_seq_lengths: List[int] = []
@@ -250,12 +252,22 @@ class MEDSCollator:
             float_values = [v if v is not None else 0.0 for v in values]
             value_present = [1 if v is not None else 0 for v in values]
 
+            if times_win is not None:
+                hsf = _hours_since_first_window(times_win)
+            else:
+                hsf = [float(i) for i in range(len(codes))]
+            if len(hsf) < len(codes):
+                hsf = hsf + [0.0] * (len(codes) - len(hsf))
+            elif len(hsf) > len(codes):
+                hsf = hsf[: len(codes)]
+
             all_codes.append(torch.tensor(codes, dtype=torch.long))
             all_masks.append(torch.tensor(attention_mask, dtype=torch.long))
             all_values.append(torch.tensor(float_values, dtype=torch.float))
             all_value_masks.append(torch.tensor(value_present, dtype=torch.long))
             all_z_scores.append(torch.tensor(z_scores, dtype=torch.float))
             all_delta_times.append(torch.tensor(delta_times, dtype=torch.float))
+            all_hours_since_first.append(torch.tensor(hsf, dtype=torch.float))
             labels.append(item.get("label", 0))
             subject_ids.append(item.get("subject_id", -1))
 
@@ -266,6 +278,7 @@ class MEDSCollator:
             "value_mask": torch.stack(all_value_masks),
             "z_scores": torch.stack(all_z_scores),
             "delta_times": torch.stack(all_delta_times),
+            "hours_since_first": torch.stack(all_hours_since_first),
             "labels": torch.tensor(labels, dtype=torch.long),
             "subject_ids": torch.tensor(subject_ids, dtype=torch.long),
         }
