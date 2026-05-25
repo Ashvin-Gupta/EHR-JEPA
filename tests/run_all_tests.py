@@ -100,12 +100,10 @@ SUITES = {
         ],
     ),
     "causal_future_masking": (
-        "CausalFutureMasker — S pairs, time/event caps, no leakage",
+        "CausalFutureMasker — S pairs, full future window, no leakage",
         [
             _tcf.test_no_future_in_context,
-            _tcf.test_target_respects_64_events,
-            _tcf.test_target_respects_12h,
-            _tcf.test_capped_context_shorter_than_prefix,
+            _tcf.test_target_runs_to_sequence_end,
             _tcf.test_min_target_events_skips_pair_when_impossible,
             _tcf.test_non_empty_targets_meet_min_events,
             _tcf.test_padding_positions_ignored,
@@ -116,8 +114,7 @@ SUITES = {
         [
             _tcsc.test_single_span_output_shape,
             _tcsc.test_no_future_in_context,
-            _tcsc.test_target_respects_max_events,
-            _tcsc.test_target_respects_max_hours,
+            _tcsc.test_target_runs_to_sequence_end,
             _tcsc.test_min_context_events,
             _tcsc.test_target_delta_minutes_from_cut,
             _tcsc.test_impossible_sequence_returns_empty_target,
@@ -133,12 +130,15 @@ SUITES = {
         ],
     ),
     "causal_single_attn_mask": (
-        "causal_single quadrant predictor self-attention mask",
+        "causal_single structured predictor self-attention masks",
         [
             _tcsam.test_quadrant_mask_four_blocks,
             _tcsam.test_quadrant_mask_cls_attention,
             _tcsam.test_quadrant_mask_batch_padded_row,
+            _tcsam.test_partial_causal_top_left_triangular,
+            _tcsam.test_partial_causal_batch_shape,
             _tcsam.test_quadrant_forward_finite,
+            _tcsam.test_partial_causal_forward_finite,
             _tcsam.test_unknown_attn_mode_raises,
         ],
     ),

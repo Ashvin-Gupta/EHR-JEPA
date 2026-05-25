@@ -94,7 +94,10 @@ class HoursSinceFirstEmbedding(nn.Module):
         -------
         FloatTensor (..., d_model) additive vectors.
         """
-        h = torch.log1p(hours.clamp(min=0).float()).unsqueeze(-1)
+        h = torch.nan_to_num(
+            hours.clamp(min=0).float(), nan=0.0, posinf=0.0, neginf=0.0
+        )
+        h = torch.log1p(h).unsqueeze(-1)
         return self.mlp(h)
 
 

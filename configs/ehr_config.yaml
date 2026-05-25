@@ -80,7 +80,7 @@ masking:
   # span_budget — random span mask (shared context, multiple targets).
   # causal_single — random context_start s + cut t in [s, end]; context [s,t], target (t,end].
   # causal_future — S independent prefix/future pairs; 1 + S encoder passes.
-  strategy: span_budget
+  strategy: causal_single
   mask_ratio: 0.30
   default_num_spans: 4
   min_span_length: 15
@@ -89,16 +89,14 @@ masking:
   # If true, target spans may overlap (i-JEPA-style).
   # If false, spans are disjoint and cover exactly the mask budget.
   allow_overlap: false
-  # --- causal_single (defaults) / shared causal_* keys ---
-  future_max_events: 128      # used by causal_future only (ignored for causal_single)
-  future_max_hours: 6.0       # used by causal_future only (ignored for causal_single)
-  min_context_events: 10      # min tokens in [context_start, cut t]
-  min_target_events: 10       # min future-window events; resample t until met
+  # --- causal_single / causal_future ---
+  min_context_events: 5      # causal_single: min tokens in [context_start, cut t]
+  min_target_events: 5       # min future-window events; resample cut until met
   max_cutpoint_resamples: 12
   # --- causal_future only ---
   num_cutpoints_S: 4
-  # full_prefix | capped_64_or_12h (same cap as target, backward from t_s)
-  context_chunk_mode: full_prefix
+  # Target is all events after each cut through window end; distant futures are
+  # down-weighted via loss.future_time_decay_lambda (not hard event/hour caps).
 
 transformer:
   n_layers: 6
@@ -120,10 +118,12 @@ predictor:
   # causal_single + Branch B (token_predictor on [CLS | context_enc | MASK@targets]):
   #   bidirectional — full self-attention among real tokens (default)
   #   quadrant — CLS/context cannot attend to MASK slots; MASK→CLS+context allowed;
-  #              context↔context full; target↔target diagonal only
+  #              CLS+context block bidirectional; target↔target diagonal only
+  #   partial_causal — same off-diagonal blocks as quadrant, but the top-left
+  #                    (CLS + context) block is lower-triangular (causal in compact order)
   # Branch B time: per-token hours_since_first (from collator) → HoursSinceFirstEmbedding
   #   added to predictor inputs (on top of RoPE position_ids). No span midpoint/duration.
-  causal_single_attn: quadrant
+  causal_single_attn: partial_causal
   # Add a Linear + BatchNorm1d projection head after the target perceiver and
   # predictor outputs.  Breaks the LN unit-sphere constraint and gives the
   # anti-collapse objective (CovReg) a free representation space.  Recommended.
@@ -137,9 +137,10 @@ loss:
   # lambda_cov >> 1 (e.g. 100) with grad_clip disabled often blows up weights → NaN.
   # Safer starting range: 0.05–1.0; enable training.grad_clip (e.g. 1.0) if unstable.
   lambda_cov: 0.68 #masking for 0.1 of pred loss
-  # Branch B + masking.strategy causal_single: per-target-token
+  # Branch B + causal_* masking: per-target-token (vectorized on GPU)
   #   W = max(floor, exp(-future_time_decay_lambda * delta_minutes_since_cut))
   # delta_minutes = wall-clock minutes from cut t to each future event.
+  # Replaces hard future_max_events / future_max_hours caps on the target window.
   # 0 = plain unweighted MSE.  Typical lambda: 0.01–0.1 (1/min).
   future_time_decay_lambda: 0.002888
   future_time_decay_weight_floor: 0.05
@@ -156,17 +157,22 @@ training:
 
   batch_size: 96
 
-  # DataLoader parallelism.
-  # num_workers > 0 runs __getitem__ in parallel worker processes so the GPU
-  # never idles waiting for the next batch.  Set to 0 to disable (useful for
-  # debugging).  4–8 per GPU is a good starting point on most clusters.
-  num_workers: 12
-  # Each worker pre-fetches this many batches (requires num_workers > 0).
-  prefetch_factor: 4
+  # DataLoader parallelism (4–8 workers per GPU is typical; >8 can thrash CPU).
+  num_workers: 8
+  prefetch_factor: 8
+  # LRU cache of vocab-encoded sequences per subject (pretrain only; 0 = off).
+  encode_cache_size: 4096
 
   # Allocate batch tensors in page-locked (pinned) host memory for faster
   # CPU→GPU DMA transfers.  Automatically disabled when running on CPU-only.
   pin_memory: true
+
+  # ---- GPU throughput ----
+  use_amp: true              # mixed precision on CUDA (recommended)
+  amp_dtype: bf16            # bf16 (Ampere+) or float16
+  tf32: true                 # faster FP32 matmul on Ampere+
+  cudnn_benchmark: true      # faster conv/attn kernels (slightly less reproducible)
+  wandb_log_every_n_steps: 10  # reduce W&B sync overhead (1 = every step)
 
   # Unit for delta_time before log(1 + x) transform.
   # Only relevant when model.use_time: true.
@@ -186,7 +192,8 @@ training:
   min_lr_ratio: 0.1          # lr decays to min_lr_ratio * lr at end of training
 
   # ---- Gradient clipping ----
-  grad_clip: 0               # 0 = disabled
+  # 0 = no clipping; grad_norm is still logged to W&B every step.
+  grad_clip: 0
 
   # ---- Early stopping ----
   early_stopping_patience: 0   # epochs without improvement before stopping
@@ -195,15 +202,24 @@ training:
   # accuracy, rank_me, f1 (substring match on metric name).
   early_stopping_metric: "val_loss"   # "val_loss" or "train_loss"
 
-  # RankMe SVD during training (0 = validation epochs only).
+  # RankMe on target embeddings (non-pad rows, random subsample). Recomputed every
+  # N optimizer steps; between updates W&B shows the last value (flat segments).
+  # 0 = validation epochs only. 1 = every step (more W&B detail, slightly slower).
   rank_me_every_n_steps: 50
   rank_me_train_max_rows: 256
+
+  # JEPA forward debugging (prints on rank 0).  Always logs when l_pred=l_cov=0 if
+  # debug_jepa_on_zero_loss is true.
+  debug_jepa: false
+  debug_jepa_first_batches: 5
+  debug_jepa_every_n_steps: 200
+  debug_jepa_on_zero_loss: true
 
   n_epochs: 20
 
   # Directory where best.pt and last.pt checkpoints are written.
   # Set to "" or omit to disable checkpointing.
-  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/Thur21stMayspan_budget/checkpoints"
+  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/Fri22ndMaycausal_single/checkpoints"
 
 # ---------------------------------------------------------------------------
 # Inline downstream evaluation

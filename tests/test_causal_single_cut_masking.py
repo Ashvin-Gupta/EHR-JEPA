@@ -88,10 +88,8 @@ def test_tokens_before_context_start_excluded():
 
 
 def test_target_runs_to_sequence_end():
-    """Target is (t, last_real]; not capped by future_max (ignored)."""
+    """Target is (t, last_real]; loss decay down-weights distant events."""
     m = CausalSingleCutMasker(
-        future_max_events=5,
-        future_max_hours=0.01,
         min_context_events=5,
         min_target_events=20,
         seed=3,

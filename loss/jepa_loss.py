@@ -96,3 +96,32 @@ def jepa_prediction_loss_token_masked(
         w = weights.to(device=z_pred.device, dtype=per_token.dtype)
         m = m * w
     return (per_token * m).sum() / m.sum().clamp(min=eps)
+
+
+def future_time_decay_weights(
+    delta_minutes: torch.Tensor,
+    lam: float,
+    floor: float = 0.0,
+    *,
+    mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """
+    W = exp(-lam * delta_minutes), optionally clamped below at ``floor``.
+
+    Parameters
+    ----------
+    delta_minutes:
+        (B, N) minutes since the causal cut (or equivalent).
+    lam:
+        Decay rate in 1/minutes; use 0 to return ones (caller should skip).
+    floor:
+        Minimum weight when > 0.
+    mask:
+        Optional (B, N) multiplier (e.g. token_mask); zeros stay zero.
+    """
+    w = torch.exp(-lam * delta_minutes.clamp(min=0).float())
+    if floor > 0:
+        w = w.clamp(min=floor)
+    if mask is not None:
+        w = w * mask.to(device=w.device, dtype=w.dtype)
+    return w

@@ -53,14 +53,42 @@ if TYPE_CHECKING:
     from masking.span_masking import SpanMasker
 
 
+def _is_valid_timestamp(t: Any) -> bool:
+    """True when t can be used for wall-clock deltas (not None / NaT)."""
+    if t is None:
+        return False
+    try:
+        import pandas as pd
+
+        if pd.isna(t):
+            return False
+    except Exception:
+        pass
+    return True
+
+
+def _last_valid_timestamp(times: List[Any]) -> Any | None:
+    for t in reversed(times):
+        if _is_valid_timestamp(t):
+            return t
+    return None
+
+
 def _hours_since_first_window(times_seq: List[Any]) -> List[float]:
-    """Hours since first timestamp in the (already windowed/padded) list."""
+    """Hours since first valid timestamp in the (already windowed/padded) list."""
     if not times_seq:
         return []
-    t0 = times_seq[0]
+    t0: Any | None = None
+    for t in times_seq:
+        if _is_valid_timestamp(t):
+            t0 = t
+            break
+    if t0 is None:
+        return [0.0] * len(times_seq)
+
     out: List[float] = []
     for t in times_seq:
-        if t is None:
+        if not _is_valid_timestamp(t):
             out.append(0.0)
             continue
         try:
@@ -69,7 +97,10 @@ def _hours_since_first_window(times_seq: List[Any]) -> List[float]:
                 sec = float(delta.total_seconds())
             else:
                 sec = float(delta)
-            out.append(sec / 3600.0)
+            if sec != sec:  # NaN
+                out.append(0.0)
+            else:
+                out.append(sec / 3600.0)
         except Exception:
             out.append(0.0)
     return out
@@ -153,7 +184,7 @@ class MEDSCollator:
             z_scores = z_scores + [0.0] * pad_len
             delta_times = delta_times + [0.0] * pad_len
             if times_ok:
-                pad_ts = times[seq_len - 1] if seq_len > 0 else None
+                pad_ts = _last_valid_timestamp(times) if seq_len > 0 else None
                 times_out = list(times) + [pad_ts] * pad_len
             else:
                 times_out = None

@@ -80,7 +80,7 @@ downstream:
 downstream_eval:
   mode: ar
   # Causal AR: use "cls" for last-token pooling (config alias); or mean_pool over events
-  pooling: cls
+  pooling: mean_pool
   head_type: linear
   head_dropout: 0.2
   run_fraction_sweep: false
@@ -89,7 +89,7 @@ downstream_eval:
   n_epochs: 20
   lr: 1.0e-4
   weight_decay: 0.05
-  batch_size: 64
+  batch_size: 512
   early_stopping_patience: 3
   grad_clip: 1.0
   label_smoothing: 0

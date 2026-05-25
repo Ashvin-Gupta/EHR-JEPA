@@ -16,8 +16,9 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import pandas as pd
 import torch
-from data.collator import MEDSCollator
+from data.collator import MEDSCollator, _hours_since_first_window
 
 
 PAD_IDX = 0
@@ -151,6 +152,30 @@ def test_batch_multiple_items():
     print(f"  codes shape:  {batch['codes'].shape}")
     print(f"  batch codes:\n{batch['codes'].tolist()}")
     print(f"  attention_mask:\n{batch['attention_mask'].tolist()}")
+
+
+def test_hours_since_first_handles_nat():
+    """NaT / missing timestamps must not produce NaN hours_since_first."""
+    t0 = pd.Timestamp("2020-01-01")
+    t1 = pd.Timestamp("2020-01-02")
+    assert _hours_since_first_window([pd.NaT, t0, t1]) == [0.0, 0.0, 24.0]
+    assert _hours_since_first_window([pd.NaT, pd.NaT]) == [0.0, 0.0]
+    assert _hours_since_first_window([t0, pd.NaT]) == [0.0, 0.0]
+
+    collator = MEDSCollator(pad_idx=PAD_IDX, max_len=6, task="pretrain", seed=0)
+    item = {
+        "subject_id": 1,
+        "codes": [1, 2, 3, 4],
+        "values": [None, None, None, None],
+        "label": 0,
+        "times": [pd.NaT, t0, t1, pd.NaT],
+    }
+    batch = collator([item])
+    hsf = batch["hours_since_first"][0]
+    assert torch.isfinite(hsf).all(), f"expected finite hours_since_first, got {hsf.tolist()}"
+    assert hsf[0].item() == 0.0
+    assert hsf[1].item() == 0.0
+    assert abs(hsf[2].item() - 24.0) < 1e-5
 
 
 def test_value_mask():

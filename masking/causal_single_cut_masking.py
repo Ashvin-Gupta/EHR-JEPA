@@ -29,9 +29,6 @@ class CausalSingleCutMasker:
     """
     Parameters
     ----------
-    future_max_events / future_max_hours:
-        Kept for config/API compatibility with causal_future; **not used** here.
-        Target length is (t, last_real] only.
     min_context_events:
         At least this many tokens in [s, t].
     min_target_events:
@@ -44,14 +41,11 @@ class CausalSingleCutMasker:
 
     def __init__(
         self,
-        future_max_events: int = 128,
-        future_max_hours: float = 6.0,
         min_context_events: int = 15,
         min_target_events: int = 15,
         max_cutpoint_resamples: int = 12,
         seed: Optional[int] = None,
     ) -> None:
-        _ = future_max_events, future_max_hours
         self.min_context_events = max(1, int(min_context_events))
         self.min_target_events = max(1, int(min_target_events))
         self.max_cutpoint_resamples = max(1, int(max_cutpoint_resamples))

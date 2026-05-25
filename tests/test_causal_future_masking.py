@@ -15,8 +15,6 @@ def _hours_linear(n: int) -> list[float]:
 def test_no_future_in_context():
     m = CausalFutureMasker(
         num_cutpoints_S=2,
-        future_max_events=8,
-        future_max_hours=100.0,
         min_target_events=1,
         seed=1,
     )
@@ -35,80 +33,41 @@ def test_no_future_in_context():
         assert set(ctx) & set(tgt) == set()
 
 
-def test_target_respects_64_events():
+def test_target_runs_to_sequence_end():
+    """Target is all reals after cut through last real (no event/hour cap)."""
     m = CausalFutureMasker(
         num_cutpoints_S=1,
-        future_max_events=5,
-        future_max_hours=1e6,
-        min_target_events=1,
+        min_target_events=5,
         seed=0,
     )
     L = 40
     attn = [1] * L
     times = _hours_linear(L)
-    # Force cut early: run many seeds until we get non-empty
     for seed in range(50):
         m._rng.seed(seed)
         r = m(seq_len=L, attention_mask=attn, times_hours=times)
         if r.target_spans[0]:
-            assert len(r.target_spans[0]) <= 5
+            tgt = r.target_spans[0]
+            ctx = r.contexts[0]
+            assert len(tgt) >= 5
+            assert max(tgt) == L - 1
+            assert max(ctx) < min(tgt)
             break
     else:
         raise AssertionError("expected at least one non-empty target")
 
 
-def test_target_respects_12h():
-    """With 1h between events, at most 3 targets fit in a 3h window (+ first event)."""
-    m = CausalFutureMasker(
-        num_cutpoints_S=1,
-        future_max_events=500,
-        future_max_hours=3.0,
-        min_target_events=1,
-        seed=42,
-    )
-    L = 80
-    attn = [1] * L
-    times = [float(i) for i in range(L)]
-    r = m(seq_len=L, attention_mask=attn, times_hours=times)
-    for tgt in r.target_spans:
-        if len(tgt) < 2:
-            continue
-        t_cut = tgt[0] - 1
-        for p in tgt:
-            assert times[p] - times[t_cut] <= 3.0 + 1e-5
-
-
-def test_capped_context_shorter_than_prefix():
-    m = CausalFutureMasker(
-        num_cutpoints_S=1,
-        future_max_events=4,
-        future_max_hours=2.0,
-        context_chunk_mode="capped_64_or_12h",
-        min_target_events=1,
-        seed=0,
-    )
-    L = 30
-    attn = [1] * L
-    times = _hours_linear(L)
-    r = m(seq_len=L, attention_mask=attn, times_hours=times)
-    ctx, tgt = r.contexts[0], r.target_spans[0]
-    if ctx and tgt:
-        assert len(ctx) <= 4
-
-
 def test_min_target_events_skips_pair_when_impossible():
-    """If the time/event caps make it impossible to fit min_target_events, all pairs empty."""
+    """If the window cannot fit min_target_events after any cut, targets are empty."""
     m = CausalFutureMasker(
         num_cutpoints_S=2,
-        future_max_events=100,
-        future_max_hours=0.0001,
-        min_target_events=1,
+        min_target_events=50,
         max_cutpoint_resamples=8,
         seed=0,
     )
     L = 20
     attn = [1] * L
-    times = [float(i) for i in range(L)]  # 1h between events; window too short for any target
+    times = _hours_linear(L)
     r = m(seq_len=L, attention_mask=attn, times_hours=times)
     for tgt in r.target_spans:
         assert tgt == []
@@ -128,8 +87,6 @@ def test_padding_positions_ignored():
 def test_non_empty_targets_meet_min_events():
     m = CausalFutureMasker(
         num_cutpoints_S=3,
-        future_max_events=30,
-        future_max_hours=1e6,
         min_target_events=12,
         max_cutpoint_resamples=80,
         seed=7,
@@ -148,9 +105,7 @@ if __name__ == "__main__":
 
     tests = [
         test_no_future_in_context,
-        test_target_respects_64_events,
-        test_target_respects_12h,
-        test_capped_context_shorter_than_prefix,
+        test_target_runs_to_sequence_end,
         test_min_target_events_skips_pair_when_impossible,
         test_non_empty_targets_meet_min_events,
         test_padding_positions_ignored,

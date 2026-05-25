@@ -22,7 +22,13 @@ from models.event_embedding import EmbeddingConfig, EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
 from models.predictor import HoursSinceFirstEmbedding, Predictor, TemporalSpanPrompt
 from models.transformer_encoder import EHRTransformerEncoder, TransformerEncoderConfig
-from training.trainer import JEPATrainer, TrainerConfig
+from training.trainer import (
+    JEPATrainer,
+    TrainerConfig,
+    _rank_me_from_rows,
+    _sample_target_rows_for_rank_me,
+    _total_grad_norm,
+)
 
 # ------------------------------------------------------------------
 # Constants
@@ -573,6 +579,58 @@ def test_target_perceiver_pad_mask_ignored():
     assert torch.allclose(z_real, z_b, atol=1e-5)
 
 
+def test_causal_single_first_row_empty_still_trains():
+    """Batch row 0 with failed mask must not skip training for rows 1..B-1."""
+    trainer = _build_trainer(
+        use_perceiver=False,
+        masking_strategy="causal_single",
+        min_span_for_perceiver=5,
+        min_target_events=5,
+    )
+    L = 64
+    codes = torch.randint(0, VOCAB, (2, L))
+    attn = torch.ones(2, L, dtype=torch.long)
+    pre = {
+        "mask_context_indices": [[], list(range(0, 12))],
+        "mask_target_spans": [[], [list(range(13, 30))]],
+    }
+    l_pred, l_cov, l_total = trainer(codes, attn, pre_mask=pre)
+    assert l_total.item() > 0.0
+    assert l_pred.item() > 0.0
+    assert l_cov.item() >= 0.0
+
+
+def test_causal_single_mixed_valid_invalid_batch_not_zeroed():
+    """One empty mask row must not zero loss/metrics for the whole batch."""
+    trainer = _build_trainer(
+        use_perceiver=False,
+        masking_strategy="causal_single",
+        min_span_for_perceiver=5,
+    )
+    L = 64
+    codes = torch.randint(0, VOCAB, (4, L))
+    attn = torch.ones(4, L, dtype=torch.long)
+    pre = {
+        "mask_context_indices": [
+            list(range(0, 16)),
+            list(range(0, 14)),
+            [],
+            list(range(0, 18)),
+        ],
+        "mask_target_spans": [
+            [list(range(17, 40))],
+            [list(range(15, 35))],
+            [],
+            [list(range(19, 45))],
+        ],
+    }
+    l_pred, l_cov, l_total = trainer(codes, attn, pre_mask=pre)
+    assert l_total.item() > 0.0
+    assert trainer._batch_mon["avg_context_length"] > 0.0
+    assert trainer._batch_mon["avg_target_span_length"] > 0.0
+    assert trainer._batch_mon["causal_valid_mask_fraction"] == 0.75
+
+
 def test_causal_single_hours_since_first_affects_loss():
     """Per-token hours_since_first must change loss and train HoursSinceFirstEmbedding."""
     trainer = _build_trainer(
@@ -612,6 +670,35 @@ def test_shared_encoder_weights():
     print(f"  Encoder module id: {enc_ids}")
     # There is exactly one EHRTransformerEncoder registered as 'encoder'
     assert len(enc_ids) == 1
+
+
+def test_total_grad_norm_nonzero_after_backward():
+    trainer = _build_trainer(use_perceiver=False)
+    codes, attn_mask, *_ = _make_batch()
+    trainer.zero_grad()
+    l_pred, l_cov, l_total = trainer(codes, attn_mask)
+    l_total.backward()
+    gn = _total_grad_norm(trainer.parameters())
+    assert gn > 0.0, f"expected positive grad norm, got {gn}"
+
+
+def test_sample_target_rows_for_rank_me_excludes_pad():
+    B, L, d = 2, 10, 8
+    span = torch.randn(B, L, d)
+    pad = torch.ones(B, L, dtype=torch.bool)
+    pad[0, :3] = False
+    pad[1, :5] = False
+    rows = _sample_target_rows_for_rank_me(span, pad, max_rows=256)
+    assert rows.shape == (8, d)
+    assert _rank_me_from_rows(rows) > 0.0
+
+
+def test_rank_me_differs_on_different_embeddings():
+    z1 = torch.randn(64, 32)
+    z2 = torch.randn(64, 32) * 3.0
+    r1 = _rank_me_from_rows(z1)
+    r2 = _rank_me_from_rows(z2)
+    assert abs(r1 - r2) > 1e-3
 
 
 if __name__ == "__main__":

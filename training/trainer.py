@@ -47,6 +47,7 @@ from torch.utils.data import DataLoader
 
 from loss.covariance_reg import SIGRegLoss
 from loss.jepa_loss import (
+    future_time_decay_weights,
     jepa_prediction_loss,
     jepa_prediction_loss_token_masked,
     jepa_prediction_loss_weighted,
@@ -58,7 +59,10 @@ from models.event_embedding import EventEmbedding
 from models.latent_pooling import LatentCrossAttentionPool
 from models.predictor import HoursSinceFirstEmbedding, Predictor, TemporalSpanPrompt
 from models.projection_head import ProjectionHead
-from models.attention_masks import build_causal_single_quadrant_mask_batch
+from models.attention_masks import (
+    build_causal_single_partial_causal_mask_batch,
+    build_causal_single_quadrant_mask_batch,
+)
 from models.transformer_encoder import EHRTransformerEncoder
 
 from training.checkpoint_utils import save_jepa_split_checkpoints
@@ -158,6 +162,31 @@ def _zero_loss_connected(t: torch.Tensor) -> torch.Tensor:
     return t.new_zeros((), requires_grad=True)
 
 
+def _format_forward_debug(dbg: Dict) -> str:
+    """One-line summary of the last forward() debug snapshot."""
+    parts = [f"path={dbg.get('zero_path', 'ok')}"]
+    for key in (
+        "pre_mask",
+        "num_spans",
+        "n_mask_ok",
+        "B",
+        "n_real_tokens",
+        "len_target_spans_list",
+        "tgt_tensor_shape",
+        "n_valid_bs",
+        "B_eff",
+        "avg_nc",
+        "avg_nt",
+        "l_pred",
+        "l_cov",
+        "rank_me_recomputed",
+        "rank_me",
+    ):
+        if key in dbg:
+            parts.append(f"{key}={dbg[key]}")
+    return "  ".join(parts)
+
+
 def _early_stopping_higher_is_better(metric_name: str) -> bool:
     """True when a larger monitor value is better (e.g. AUROC, accuracy)."""
     name = metric_name.lower()
@@ -198,6 +227,39 @@ def _rank_me_from_rows(z_rows: torch.Tensor) -> float:
         return 0.0
 
 
+def _total_grad_norm(parameters) -> float:
+    """L2 norm over all parameter gradients (0 if no grads)."""
+    norms = [
+        p.grad.detach().norm(2)
+        for p in parameters
+        if p.grad is not None
+    ]
+    if not norms:
+        return 0.0
+    return float(torch.norm(torch.stack(norms), 2).item())
+
+
+def _sample_target_rows_for_rank_me(
+    span_t: torch.Tensor,
+    pad_mask: torch.Tensor,
+    max_rows: int,
+) -> torch.Tensor:
+    """
+    Real (non-pad) target embeddings for RankMe.
+
+    span_t: (B, L, d); pad_mask: (B, L) with True on padded positions.
+    """
+    if span_t.ndim != 3 or pad_mask.shape != span_t.shape[:2]:
+        return span_t.new_zeros(0, span_t.shape[-1])
+    real = span_t[~pad_mask]
+    if real.shape[0] < 2:
+        return real
+    if real.shape[0] <= max_rows:
+        return real
+    idx = torch.randperm(real.shape[0], device=real.device)[:max_rows]
+    return real[idx]
+
+
 @dataclass
 class TrainerConfig:
     # Branch selection
@@ -221,8 +283,10 @@ class TrainerConfig:
     min_target_events: int = 10
     # causal_single Branch B token_predictor self-attention:
     #   "bidirectional" — full attention among real tokens (default)
-    #   "quadrant" — context↔context full; block context→target; target→context full;
-    #                target↔target diagonal only
+    #   "quadrant" — top-left (CLS+context) bidirectional; block context→target;
+    #                target→context full; target↔target diagonal only
+    #   "partial_causal" — same as quadrant except top-left is lower-triangular
+    #                      (causal along [CLS | context] compact order)
     causal_single_predictor_attn: str = "bidirectional"
 
     # Optimiser
@@ -246,6 +310,13 @@ class TrainerConfig:
     rank_me_every_n_steps: int = 50
     rank_me_train_max_rows: int = 256
 
+    # Mixed precision (CUDA only). bf16 is preferred on Ampere+; float16 uses GradScaler.
+    use_amp: bool = True
+    amp_dtype: str = "bf16"
+
+    # W&B batch metrics: log every N optimizer steps (1 = every step).
+    wandb_log_every_n_steps: int = 10
+
     # Checkpointing — set to "" to disable
     # Best model (by val_loss, or train_loss if no val set) is saved to
     # {checkpoint_dir}/best.pt.  End-of-training model saved to
@@ -255,6 +326,12 @@ class TrainerConfig:
     # General
     n_epochs: int = 10
     device: str = "cpu"
+
+    # Forward-path debugging (main process only in train_loop).
+    debug_jepa: bool = False
+    debug_jepa_first_batches: int = 5
+    debug_jepa_every_n_steps: int = 0
+    debug_jepa_on_zero_loss: bool = True
 
     # masking.strategy from YAML ("span_budget" | "causal_single" | "causal_future").
     # causal_single uses span batch keys (one cut); causal_future uses multi-cut keys.
@@ -351,6 +428,67 @@ class JEPATrainer(nn.Module):
         # available without changing the public return signature to 5+ values.
         self._batch_mon: Dict[str, float] = {}
         self._last_rank_me: float = 0.0
+        self._forward_debug: Dict = {}
+
+    def _dbg(self, **kwargs) -> None:
+        """Merge debug fields for the current forward (train_loop may print)."""
+        self._forward_debug.update(kwargs)
+
+    def _log_jepa_debug(
+        self,
+        *,
+        global_step: int,
+        epoch: int,
+        batch_in_epoch: int,
+        l_pred: float,
+        l_cov: float,
+        l_total: float,
+        force: bool = False,
+    ) -> None:
+        """Print forward-path diagnostics on the main process."""
+        cfg = self.config
+        if not cfg.debug_jepa and not force:
+            if not cfg.debug_jepa_on_zero_loss:
+                return
+            if l_pred != 0.0 or l_cov != 0.0:
+                return
+
+        should_print = force or cfg.debug_jepa
+        if cfg.debug_jepa and not should_print:
+            if batch_in_epoch < cfg.debug_jepa_first_batches:
+                should_print = True
+            if (
+                cfg.debug_jepa_every_n_steps > 0
+                and global_step % cfg.debug_jepa_every_n_steps == 0
+            ):
+                should_print = True
+        if cfg.debug_jepa_on_zero_loss and (l_pred == 0.0 and l_cov == 0.0):
+            should_print = True
+        if not should_print:
+            return
+
+        dbg = dict(self._forward_debug)
+        print(
+            f"[jepa-debug] epoch={epoch} step={global_step} batch={batch_in_epoch} "
+            f"l_pred={l_pred:.6f} l_cov={l_cov:.6f} l_total={l_total:.6f} "
+            f"grad={dbg.get('l_total_requires_grad', '?')}",
+            flush=True,
+        )
+        print(f"  {_format_forward_debug(dbg)}", flush=True)
+        mon = self._batch_mon
+        print(
+            f"  mon: avg_ctx={mon.get('avg_context_length', 0):.2f} "
+            f"avg_tgt={mon.get('avg_target_span_length', 0):.2f} "
+            f"valid_mask_frac={mon.get('causal_valid_mask_fraction', float('nan')):.3f} "
+            f"std_dev={mon.get('std_dev_embeddings', 0):.4f} "
+            f"rank_me={mon.get('rank_me', 0):.1f} "
+            f"N_in={mon.get('_N_input', 0)} N_tgt={mon.get('_N_target', 0)}",
+            flush=True,
+        )
+        if dbg.get("num_spans_per_sample_summary"):
+            print(f"  spans/batch: {dbg['num_spans_per_sample_summary']}", flush=True)
+        if dbg.get("sample_mask_preview"):
+            print(f"  sample[0]: {dbg['sample_mask_preview']}", flush=True)
 
     # ------------------------------------------------------------------
     # Forward
@@ -392,6 +530,17 @@ class JEPATrainer(nn.Module):
         """
         B, L = codes.shape
         device = codes.device
+        self._forward_debug = {}
+        n_real_batch = int(attention_mask.sum().item())
+        self._dbg(
+            masking_strategy=self.config.masking_strategy,
+            use_perceiver=self.config.use_perceiver,
+            B=B,
+            L=L,
+            n_real_tokens=n_real_batch,
+            pre_mask=pre_mask is not None,
+            min_target_events_cfg=self.config.min_target_events,
+        )
 
         # 1a. Embeddings
         x = self.embedding(
@@ -523,17 +672,61 @@ class JEPATrainer(nn.Module):
         N_target_full = sum(per_sample_target_area_full)
         N_context_full = N_model_pre - N_target_full
 
-        # Use minimum num_spans across batch for uniform tensors
+        # Align span count across batch.  Ignore samples with no spans (causal_single
+        # failures return target_spans=[]); a single empty row must not force
+        # num_spans=0 and zero the whole batch.
         num_spans_per_sample = [len(spans) for spans in all_target_spans]
-        num_spans = min(num_spans_per_sample) if num_spans_per_sample else 0
+        positive_span_counts = [n for n in num_spans_per_sample if n > 0]
+        num_spans = min(positive_span_counts) if positive_span_counts else 0
+        n_mask_ok = sum(1 for n in num_spans_per_sample if n > 0)
+
+        avg_ctx_len = sum(len(ctx) for ctx in all_context_indices) / max(B_size_pre, 1)
+        avg_tgt_area = sum(per_sample_target_area_full) / max(B_size_pre, 1)
+
+        span_summary = {}
+        for n in set(num_spans_per_sample):
+            span_summary[n] = span_summary.get(n, 0) + 1
+        self._dbg(
+            num_spans=num_spans,
+            n_mask_ok=n_mask_ok,
+            num_spans_per_sample_summary=span_summary,
+        )
+        if all_context_indices:
+            b0 = 0
+            self._dbg(
+                sample_mask_preview={
+                    "ctx_len": len(all_context_indices[b0]),
+                    "tgt_spans": len(all_target_spans[b0]),
+                    "tgt_len": (
+                        len(all_target_spans[b0][0])
+                        if all_target_spans[b0]
+                        else 0
+                    ),
+                    "ctx_head": all_context_indices[b0][:5],
+                    "tgt_head": (
+                        all_target_spans[b0][0][:5]
+                        if all_target_spans[b0] and all_target_spans[b0][0]
+                        else []
+                    ),
+                }
+            )
+
         if num_spans == 0:
+            self._dbg(zero_path="num_spans_zero")
             z = _zero_loss_connected(x)
             self._batch_mon = {
                 "std_dev_embeddings": 0.0, "rank_me": 0.0,
                 "std_dev_values": _std_values, "std_dev_times": _std_times,
-                "_N_input": 0, "_N_target": 0, "_N_context": 0,
-                "avg_context_length": 0.0, "avg_target_span_length": 0.0,
+                "_N_input": N_model_pre, "_N_target": N_target_full,
+                "_N_context": N_context_full,
+                "avg_context_length": avg_ctx_len,
+                "avg_target_span_length": avg_tgt_area,
             }
+            if self.config.masking_strategy == "causal_single":
+                n_ok = sum(1 for n in num_spans_per_sample if n > 0)
+                self._batch_mon["causal_valid_mask_fraction"] = n_ok / max(
+                    B_size_pre, 1
+                )
             return z, z, z
 
         all_target_spans = [spans[:num_spans] for spans in all_target_spans]
@@ -548,6 +741,16 @@ class JEPATrainer(nn.Module):
         target_spans_list, _target_span_pad_masks = self._extract_target_spans(
             target_enc_out, all_target_spans, index_offset=1
         )  # list of num_spans tensors, each (B, N_span_s, d)
+        if target_spans_list:
+            self._dbg(
+                len_target_spans_list=len(target_spans_list),
+                tgt_tensor_shape=tuple(target_spans_list[0].shape),
+                tgt_rows_with_tokens=int(
+                    (target_spans_list[0].abs().sum(dim=-1) > 0).any(dim=-1).sum().item()
+                ),
+            )
+        else:
+            self._dbg(len_target_spans_list=0, zero_path="extract_target_spans_empty")
 
         # 4. Context pathway — compact extraction with original RoPE position IDs
         ctx_out, ctx_pos_ids, ctx_mask = self._extract_context(
@@ -596,17 +799,26 @@ class JEPATrainer(nn.Module):
         # (collapse indicator: should stay well above 0)
         with torch.no_grad():
             if target_spans_list:
-                all_tgt = torch.cat(
-                    [t.reshape(-1, t.shape[-1]) for t in target_spans_list], dim=0
-                )  # (N, d)
+                span0 = target_spans_list[0]
+                pad0 = (
+                    _target_span_pad_masks[0]
+                    if _target_span_pad_masks
+                    else torch.zeros(
+                        span0.shape[0],
+                        span0.shape[1],
+                        dtype=torch.bool,
+                        device=span0.device,
+                    )
+                )
+                rank_rows = _sample_target_rows_for_rank_me(
+                    span0, pad0, self.config.rank_me_train_max_rows
+                )
+                all_tgt = rank_rows if rank_rows.shape[0] > 0 else span0.reshape(-1, span0.shape[-1])
                 std_dev = all_tgt.std(dim=0).mean().item()
                 n_rm = self.config.rank_me_train_max_rows
                 every = self.config.rank_me_every_n_steps
-                if (
-                    every > 0
-                    and self._cov_global_step % every == 0
-                ):
-                    rank_me = _rank_me_from_rows(all_tgt[:n_rm])
+                if every > 0 and self._cov_global_step % every == 0:
+                    rank_me = _rank_me_from_rows(rank_rows)
                     self._last_rank_me = rank_me
                 else:
                     rank_me = self._last_rank_me
@@ -618,12 +830,17 @@ class JEPATrainer(nn.Module):
         # Raw token counts — use full-mask totals (see N_target_full above).
         # Ratios in train loop: target_ratio = N_target_full / N_input,
         # context_ratio = N_context_full / sum(N_sequence) (per-batch).
-        avg_ctx_len = sum(len(ctx) for ctx in all_context_indices) / max(B_size_pre, 1)
-        avg_tgt_area = sum(per_sample_target_area_full) / max(B_size_pre, 1)
+
+        rank_recomputed = bool(
+            target_spans_list
+            and self.config.rank_me_every_n_steps > 0
+            and self._cov_global_step % self.config.rank_me_every_n_steps == 0
+        )
 
         self._batch_mon = {
             "std_dev_embeddings":     std_dev,
             "rank_me":                rank_me,
+            "rank_me_updated":        rank_recomputed,
             # Feature std-devs (0.0 when feature is disabled):
             #   std_dev_values = std of z_scores (should be ~1 if normalizer healthy)
             #   std_dev_times  = std of log(1+hours) (should be ~1)
@@ -636,9 +853,15 @@ class JEPATrainer(nn.Module):
             "_N_context":             N_context_full,
             "avg_context_length":     avg_ctx_len,
             "avg_target_span_length": avg_tgt_area,
-            "_tgt_embs_for_rank": all_tgt.detach() if not self.training else None,
+            "_tgt_embs_for_rank": (
+                rank_rows.detach()
+                if not self.training and target_spans_list
+                else None
+            ),
         }
         if self.config.masking_strategy == "causal_single":
+            n_ok = sum(1 for n in num_spans_per_sample if n > 0)
+            self._batch_mon["causal_valid_mask_fraction"] = n_ok / max(B_size_pre, 1)
             self._batch_mon.update(
                 _compute_causal_single_monitoring(
                     all_context_indices,
@@ -647,6 +870,17 @@ class JEPATrainer(nn.Module):
                     context_starts=mask_context_starts,
                 )
             )
+
+        self._dbg(
+            l_pred=float(l_pred.detach().item()),
+            l_cov=float(l_cov.detach().item()),
+            l_total_requires_grad=bool(l_total.requires_grad),
+            rank_me_recomputed=rank_recomputed,
+            rank_me=float(rank_me),
+        )
+        if float(l_pred.detach().item()) == 0.0 and float(l_cov.detach().item()) == 0.0:
+            if "zero_path" not in self._forward_debug:
+                self._dbg(zero_path="loss_zero_no_tag")
 
         return l_pred, l_cov, l_total
 
@@ -760,14 +994,28 @@ class JEPATrainer(nn.Module):
         l_total = l_pred + self.config.lambda_cov * l_cov
 
         with torch.no_grad():
-            if all_tgt_embs:
-                all_tgt = torch.cat(all_tgt_embs, dim=0)
+            if target_spans_list and target_span_pad_masks:
+                rank_rows = _sample_target_rows_for_rank_me(
+                    target_spans_list[0],
+                    target_span_pad_masks[0],
+                    self.config.rank_me_train_max_rows,
+                )
+                all_tgt = (
+                    rank_rows
+                    if rank_rows.shape[0] > 0
+                    else target_spans_list[0].reshape(-1, x.shape[-1])
+                )
                 std_dev = all_tgt.std(dim=0).mean().item()
-                rank_me = _rank_me_from_rows(all_tgt[:512])
+                every = self.config.rank_me_every_n_steps
+                if every > 0 and self._cov_global_step % every == 0:
+                    rank_me = _rank_me_from_rows(rank_rows)
+                    self._last_rank_me = rank_me
+                else:
+                    rank_me = self._last_rank_me
             else:
                 all_tgt = x.new_zeros((1, x.shape[-1]))
                 std_dev = 0.0
-                rank_me = 0.0
+                rank_me = self._last_rank_me
 
         avg_ctx_len = N_context_full / max(B_size_pre * S, 1)
         avg_tgt_area = N_target_full / max(B_size_pre * S, 1)
@@ -783,7 +1031,11 @@ class JEPATrainer(nn.Module):
             "avg_context_length": avg_ctx_len,
             "avg_target_span_length": avg_tgt_area,
             "_causal_cuts_used": n_cuts_used,
-            "_tgt_embs_for_rank": all_tgt.detach() if not self.training else None,
+            "_tgt_embs_for_rank": (
+                rank_rows.detach()
+                if not self.training and target_spans_list and target_span_pad_masks
+                else None
+            ),
         }
 
         return l_pred, l_cov, l_total
@@ -808,22 +1060,23 @@ class JEPATrainer(nn.Module):
         pos_ids:    (B, max_ctx_len) — original sequence positions
         ctx_mask:   (B, max_ctx_len) — 1=real, 0=pad
         """
+        from torch.nn.utils.rnn import pad_sequence
+
         B, _, d = x.shape
-        max_ctx_len = max((len(ci) for ci in all_context_indices), default=1)
-
-        x_ctx    = x.new_zeros(B, max_ctx_len, d)
-        pos_ids  = torch.zeros(B, max_ctx_len, dtype=torch.long, device=device)
-        ctx_mask = torch.zeros(B, max_ctx_len, dtype=torch.long, device=device)
-
-        for b, ctx_idx in enumerate(all_context_indices):
-            n = len(ctx_idx)
-            if n == 0:
-                continue
-            idx_t = torch.tensor(ctx_idx, dtype=torch.long, device=device)
-            x_ctx[b, :n]   = x[b][idx_t]
-            pos_ids[b, :n]  = idx_t
-            ctx_mask[b, :n] = 1
-
+        idx_tensors = [
+            torch.tensor(ci, dtype=torch.long, device=device)
+            for ci in all_context_indices
+        ]
+        lengths = torch.tensor(
+            [t.numel() for t in idx_tensors], device=device, dtype=torch.long
+        )
+        max_ctx_len = max(int(lengths.max().item()), 1)
+        idx_pad = pad_sequence(idx_tensors, batch_first=True, padding_value=0)
+        idx_exp = idx_pad.unsqueeze(-1).expand(-1, -1, d)
+        x_ctx = torch.gather(x, 1, idx_exp)
+        pos_ids = idx_pad
+        arange = torch.arange(max_ctx_len, device=device).unsqueeze(0)
+        ctx_mask = (arange < lengths.unsqueeze(1)).to(torch.long)
         return x_ctx, pos_ids, ctx_mask
 
     def _extract_target_spans(
@@ -841,20 +1094,31 @@ class JEPATrainer(nn.Module):
         """
         B, _L, d = encoder_out.shape
         device = encoder_out.device
-        if not all_target_spans or not all_target_spans[0]:
+        if not all_target_spans:
             return [], []
-        num_spans = len(all_target_spans[0])
+        positive_span_counts = [len(s) for s in all_target_spans if len(s) > 0]
+        if not positive_span_counts:
+            return [], []
+        # Align with forward(): do not require batch row 0 to have a mask.
+        num_spans = min(positive_span_counts)
         result: List[torch.Tensor] = []
         pad_masks: List[torch.Tensor] = []
 
         for s in range(num_spans):
-            max_span_len = max(len(all_target_spans[b][s]) for b in range(B))
+            span_lens = [
+                len(all_target_spans[b][s])
+                for b in range(B)
+                if s < len(all_target_spans[b])
+            ]
+            max_span_len = max(span_lens) if span_lens else 0
             if max_span_len == 0:
                 continue
 
             span_t = encoder_out.new_zeros(B, max_span_len, d)
             pad_mask = torch.ones(B, max_span_len, dtype=torch.bool, device=device)
             for b in range(B):
+                if s >= len(all_target_spans[b]):
+                    continue
                 span_idx = all_target_spans[b][s]
                 n = len(span_idx)
                 if n == 0:
@@ -1065,6 +1329,40 @@ class JEPATrainer(nn.Module):
         b_ix = torch.arange(B, device=device).unsqueeze(1).expand(B, max_span_len)
         return full_out[b_ix, idx]
 
+    def _pack_target_delta_minutes(
+        self,
+        all_target_spans: List[List[List[int]]],
+        all_delta_minutes: List[List[List[float]]],
+        span_idx: int,
+        max_len: int,
+        device: torch.device,
+        batch_rows: Optional[List[int]] = None,
+    ) -> torch.Tensor:
+        """(B_rows, max_len) minutes since cut; zeros on pad / missing entries."""
+        rows = (
+            list(range(len(all_target_spans)))
+            if batch_rows is None
+            else batch_rows
+        )
+        B = len(rows)
+        out = torch.zeros(B, max_len, device=device, dtype=torch.float32)
+        for bi, b in enumerate(rows):
+            span = all_target_spans[b][span_idx]
+            n = min(len(span), max_len)
+            if n == 0:
+                continue
+            deltas = (
+                all_delta_minutes[b][span_idx]
+                if span_idx < len(all_delta_minutes[b])
+                else []
+            )
+            if deltas:
+                n_copy = min(n, len(deltas))
+                out[bi, :n_copy] = torch.as_tensor(
+                    deltas[:n_copy], device=device, dtype=torch.float32
+                )
+        return out
+
     def _target_span_weights_from_delta_minutes(
         self,
         all_target_spans: List[List[List[int]]],
@@ -1074,24 +1372,29 @@ class JEPATrainer(nn.Module):
         device: torch.device,
     ) -> torch.Tensor:
         """W_j = max(floor, exp(-lambda * delta_minutes_j)); 0 on pad positions."""
-        lam = self.config.future_time_decay_lambda
-        floor = self.config.future_time_decay_weight_floor
-        B = len(all_target_spans)
-        w = torch.zeros(B, max_span_len, device=device)
-        for b in range(B):
-            span = all_target_spans[b][span_idx]
-            n = min(len(span), max_span_len)
-            if n == 0:
-                continue
-            deltas = (
-                all_delta_minutes[b][span_idx]
-                if span_idx < len(all_delta_minutes[b])
-                else []
-            )
-            for j in range(n):
-                dt_min = deltas[j] if j < len(deltas) else 0.0
-                w[b, j] = max(floor, math.exp(-lam * float(dt_min)))
-        return w
+        delta_t = self._pack_target_delta_minutes(
+            all_target_spans,
+            all_delta_minutes,
+            span_idx,
+            max_span_len,
+            device,
+        )
+        span_lens = torch.tensor(
+            [
+                min(len(all_target_spans[b][span_idx]), max_span_len)
+                for b in range(len(all_target_spans))
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        pos = torch.arange(max_span_len, device=device).unsqueeze(0)
+        pad_mask = pos < span_lens.unsqueeze(1)
+        return future_time_decay_weights(
+            delta_t,
+            self.config.future_time_decay_lambda,
+            self.config.future_time_decay_weight_floor,
+            mask=pad_mask,
+        )
 
     def _forward_token_causal_single(
         self,
@@ -1118,6 +1421,7 @@ class JEPATrainer(nn.Module):
         predictor CLS is trained with context-only visibility to future MASKs.
         """
         if not target_spans_list:
+            self._dbg(zero_path="causal_single_no_target_spans_list")
             z = _zero_loss_connected(context_enc_out)
             return z, z
 
@@ -1127,20 +1431,43 @@ class JEPATrainer(nn.Module):
         span_idx = 0
         min_tgt = self.config.min_target_events
 
-        valid_bs: List[int] = []
-        lengths_c: List[int] = []
-        lengths_t: List[int] = []
-        for b in range(B):
-            nc = int(ctx_mask[b].sum().item())
-            nt = len(all_target_spans[b][span_idx])
-            lengths_c.append(nc)
-            lengths_t.append(nt)
-            if nc > 0 and nt >= min_tgt:
-                valid_bs.append(b)
+        ctx_lens = ctx_mask.sum(dim=1)
+        tgt_lens = torch.tensor(
+            [
+                len(all_target_spans[b][span_idx])
+                if span_idx < len(all_target_spans[b])
+                else 0
+                for b in range(B)
+            ],
+            device=device,
+            dtype=torch.long,
+        )
+        lengths_c = ctx_lens.tolist()
+        lengths_t = tgt_lens.tolist()
+        valid_mask = (ctx_lens > 0) & (tgt_lens >= min_tgt)
+        valid_bs = valid_mask.nonzero(as_tuple=False).flatten().tolist()
 
         if not valid_bs:
+            self._dbg(
+                zero_path="causal_single_no_valid_bs",
+                n_valid_bs=0,
+                B=B,
+                min_tgt_required=min_tgt,
+                lengths_t_sample=lengths_t[: min(8, len(lengths_t))],
+                lengths_c_sample=lengths_c[: min(8, len(lengths_c))],
+            )
             z = _zero_loss_connected(context_enc_out)
             return z, z
+
+        avg_nc = sum(lengths_c[b] for b in valid_bs) / len(valid_bs)
+        avg_nt = sum(lengths_t[b] for b in valid_bs) / len(valid_bs)
+        self._dbg(
+            n_valid_bs=len(valid_bs),
+            B_eff=len(valid_bs),
+            avg_nc=round(avg_nc, 2),
+            avg_nt=round(avg_nt, 2),
+            min_tgt_required=min_tgt,
+        )
 
         max_compact = max(1 + lengths_c[b] + lengths_t[b] for b in valid_bs)
         max_n_tgt = max(lengths_t[b] for b in valid_bs)
@@ -1149,17 +1476,18 @@ class JEPATrainer(nn.Module):
         x_cat = context_enc_out.new_zeros(B_eff, max_compact, d)
         pos_cat = torch.zeros(B_eff, max_compact, dtype=torch.long, device=device)
         attn_cat = torch.zeros(B_eff, max_compact, dtype=torch.long, device=device)
+        hours_batch = torch.zeros(B_eff, max_compact, device=device, dtype=torch.float)
 
         for bi, b in enumerate(valid_bs):
             nc, nt = lengths_c[b], lengths_t[b]
             compact_len = 1 + nc + nt
-            hours_slots = torch.zeros(compact_len, device=device, dtype=torch.float)
-            hours_slots[0] = 0.0
+            hours_batch[bi, 0] = 0.0
             if nc > 0:
-                hours_slots[1 : 1 + nc] = hours_since_first[b, ctx_pos_ids[b, :nc]]
+                hours_batch[bi, 1 : 1 + nc] = hours_since_first[b, ctx_pos_ids[b, :nc]]
             tgt_idx = all_target_spans[b][span_idx]
-            for j, p in enumerate(tgt_idx[:nt]):
-                hours_slots[1 + nc + j] = hours_since_first[b, p]
+            if nt > 0:
+                tgt_pos = torch.tensor(tgt_idx[:nt], device=device, dtype=torch.long)
+                hours_batch[bi, 1 + nc : compact_len] = hours_since_first[b, tgt_pos]
 
             x_cat[bi, 0] = self.cls_token
             pos_cat[bi, 0] = 0
@@ -1168,31 +1496,40 @@ class JEPATrainer(nn.Module):
                 x_cat[bi, 1 : 1 + nc] = context_enc_out[b, :nc]
                 pos_cat[bi, 1 : 1 + nc] = ctx_pos_ids[b, :nc]
                 attn_cat[bi, 1 : 1 + nc] = 1
-            for j in range(nt):
-                p = int(tgt_idx[j])
-                x_cat[bi, 1 + nc + j] = self.mask_token
-                pos_cat[bi, 1 + nc + j] = p
-                attn_cat[bi, 1 + nc + j] = 1
-            x_cat[bi, :compact_len] = x_cat[bi, :compact_len] + self.time_embed(
-                hours_slots
-            )
+            if nt > 0:
+                x_cat[bi, 1 + nc : compact_len] = self.mask_token
+                pos_cat[bi, 1 + nc : compact_len] = tgt_pos
+                attn_cat[bi, 1 + nc : compact_len] = 1
+
+        time_bias = self.time_embed(hours_batch.reshape(-1)).view(B_eff, max_compact, d)
+        x_cat = x_cat + time_bias * attn_cat.unsqueeze(-1).to(x_cat.dtype)
 
         if not torch.isfinite(x_cat).all():
+            hsf_finite = bool(torch.isfinite(hours_since_first).all())
+            self._dbg(
+                zero_path="causal_single_nonfinite_x_cat",
+                hours_since_first_finite=hsf_finite,
+            )
             z = _zero_loss_connected(context_enc_out)
             return z, z
 
         attn_mode = self.config.causal_single_predictor_attn
-        if attn_mode not in ("bidirectional", "quadrant"):
+        if attn_mode not in ("bidirectional", "quadrant", "partial_causal"):
             raise ValueError(
-                f"causal_single_predictor_attn must be 'bidirectional' or 'quadrant', "
-                f"got {attn_mode!r}"
+                f"causal_single_predictor_attn must be 'bidirectional', 'quadrant', "
+                f"or 'partial_causal', got {attn_mode!r}"
             )
 
         attn_bias = None
-        if attn_mode == "quadrant":
+        if attn_mode in ("quadrant", "partial_causal"):
             lc = [lengths_c[b] for b in valid_bs]
             lt = [lengths_t[b] for b in valid_bs]
-            attn_bias = build_causal_single_quadrant_mask_batch(
+            build_mask = (
+                build_causal_single_partial_causal_mask_batch
+                if attn_mode == "partial_causal"
+                else build_causal_single_quadrant_mask_batch
+            )
+            attn_bias = build_mask(
                 lc, lt, max_compact, include_cls=True, device=device
             )
 
@@ -1212,21 +1549,31 @@ class JEPATrainer(nn.Module):
             self.config.future_time_decay_lambda > 0
             and all_target_delta_minutes is not None
         )
-        lam = self.config.future_time_decay_lambda
-        floor = self.config.future_time_decay_weight_floor
 
         for bi, b in enumerate(valid_bs):
             nc, nt = lengths_c[b], lengths_t[b]
             y_hat[bi, :nt] = out[bi, 1 + nc : 1 + nc + nt]
             y_tgt[bi, :nt] = y_tgt_full[b, :nt]
             token_mask[bi, :nt] = 1.0
-            if use_time_decay:
-                deltas = all_target_delta_minutes[b][span_idx]
-                for j in range(nt):
-                    dt_min = deltas[j] if j < len(deltas) else 0.0
-                    loss_weights[bi, j] = max(floor, math.exp(-lam * float(dt_min)))
+
+        if use_time_decay:
+            delta_t = self._pack_target_delta_minutes(
+                all_target_spans,
+                all_target_delta_minutes,
+                span_idx,
+                max_n_tgt,
+                device,
+                batch_rows=valid_bs,
+            )
+            loss_weights = future_time_decay_weights(
+                delta_t,
+                self.config.future_time_decay_lambda,
+                self.config.future_time_decay_weight_floor,
+                mask=token_mask,
+            )
 
         if not torch.isfinite(y_hat).all() or not torch.isfinite(y_tgt).all():
+            self._dbg(zero_path="causal_single_nonfinite_y_hat_y_tgt")
             z = _zero_loss_connected(context_enc_out)
             return z, z
 
@@ -1240,12 +1587,14 @@ class JEPATrainer(nn.Module):
             l_pred = jepa_prediction_loss_token_masked(y_hat, y_tgt, token_mask)
 
         if not torch.isfinite(l_pred):
+            self._dbg(zero_path="causal_single_nonfinite_l_pred")
             z = _zero_loss_connected(context_enc_out)
             return z, z
 
         n_cov = int(token_mask.sum().item())
         if n_cov < 2:
             l_cov = y_tgt.sum() * 0.0
+            self._dbg(zero_path="causal_single_cov_skipped", n_cov_tokens=n_cov)
         else:
             y_cov = y_tgt[token_mask.bool()]
             l_cov = self.cov_loss(
@@ -1253,6 +1602,12 @@ class JEPATrainer(nn.Module):
                 global_step=self._cov_global_step,
                 sync_ddp=self._cov_sync_ddp,
             )
+        self._dbg(
+            causal_l_pred=float(l_pred.detach().item()),
+            causal_l_cov=float(l_cov.detach().item()),
+            n_cov_tokens=n_cov,
+            token_weight_sum=float(loss_weights.sum().item()) if use_time_decay else float(token_mask.sum().item()),
+        )
         return l_pred, l_cov
 
     def _forward_token(
@@ -1711,6 +2066,16 @@ class JEPATrainer(nn.Module):
             os.makedirs(ckpt_dir, exist_ok=True)
             print(f"[train] Checkpoints:     {ckpt_dir}")
 
+        use_amp = cfg.use_amp and device.type == "cuda"
+        amp_dtype = (
+            torch.bfloat16
+            if cfg.amp_dtype in ("bf16", "bfloat16")
+            else torch.float16
+        )
+        use_grad_scaler = use_amp and amp_dtype == torch.float16
+        scaler = torch.amp.GradScaler("cuda", enabled=use_grad_scaler)
+        log_every = max(1, cfg.wandb_log_every_n_steps)
+
         if is_main_process:
             branch = "Perceiver (A)" if cfg.use_perceiver else "Token I-JEPA (B)"
             print(f"[train] Branch:          {branch}")
@@ -1720,6 +2085,17 @@ class JEPATrainer(nn.Module):
             print(f"[train] lambda_cov:      {cfg.lambda_cov}")
             print(f"[train] Early stopping:  "
                   f"{'disabled' if cfg.early_stopping_patience == 0 else f'patience={cfg.early_stopping_patience}, metric={cfg.early_stopping_metric}'}")
+            if cfg.debug_jepa or cfg.debug_jepa_on_zero_loss:
+                print(
+                    f"[train] JEPA debug:      on (first_batches={cfg.debug_jepa_first_batches}, "
+                    f"every_n_steps={cfg.debug_jepa_every_n_steps}, on_zero_loss={cfg.debug_jepa_on_zero_loss})"
+                )
+            print(
+                f"[train] AMP:             "
+                f"{'off' if not use_amp else amp_dtype}  "
+                f"(grad_scaler={use_grad_scaler})"
+            )
+            print(f"[train] W&B batch log:   every {log_every} step(s)")
             print()
 
         global_step = 0
@@ -1764,17 +2140,31 @@ class JEPATrainer(nn.Module):
                 # SIGReg: same projection directions on every GPU (seed = step index).
                 self._cov_global_step = global_step
 
-                optimizer.zero_grad()
-                l_pred, l_cov, l_total = _forward(
-                    codes,
-                    attn_mask,
-                    values,
-                    z_scores,
-                    delta_times,
-                    value_mask,
-                    hours_since_first=hours_since_first,
-                    pre_mask=pre_mask,
-                )
+                optimizer.zero_grad(set_to_none=True)
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=amp_dtype,
+                    enabled=use_amp,
+                ):
+                    l_pred, l_cov, l_total = _forward(
+                        codes,
+                        attn_mask,
+                        values,
+                        z_scores,
+                        delta_times,
+                        value_mask,
+                        hours_since_first=hours_since_first,
+                        pre_mask=pre_mask,
+                    )
+                if is_main_process:
+                    self._log_jepa_debug(
+                        global_step=global_step,
+                        epoch=epoch,
+                        batch_in_epoch=n_batches,
+                        l_pred=l_pred.item(),
+                        l_cov=l_cov.item(),
+                        l_total=l_total.item(),
+                    )
                 if is_main_process and not (
                     torch.isfinite(l_pred) and torch.isfinite(l_cov) and torch.isfinite(l_total)
                 ):
@@ -1787,7 +2177,10 @@ class JEPATrainer(nn.Module):
                         flush=True,
                     )
                 if l_total.requires_grad:
-                    l_total.backward()
+                    if use_grad_scaler:
+                        scaler.scale(l_total).backward()
+                    else:
+                        l_total.backward()
                 elif is_main_process:
                     print(
                         f"[train][WARN] step={global_step}: loss has no grad "
@@ -1796,12 +2189,17 @@ class JEPATrainer(nn.Module):
                     )
 
                 grad_norm = 0.0
-                if cfg.grad_clip > 0:
-                    grad_norm = nn.utils.clip_grad_norm_(
-                        self.parameters(), cfg.grad_clip
-                    ).item()
-
-                optimizer.step()
+                if l_total.requires_grad:
+                    if use_grad_scaler:
+                        scaler.unscale_(optimizer)
+                    grad_norm = _total_grad_norm(self.parameters())
+                    if cfg.grad_clip > 0:
+                        nn.utils.clip_grad_norm_(self.parameters(), cfg.grad_clip)
+                    if use_grad_scaler:
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
 
@@ -1819,7 +2217,11 @@ class JEPATrainer(nn.Module):
                 epoch_progress = epoch + n_batches / max(total_batches, 1)
                 global_step  += 1
 
-                if is_main_process and on_batch_end is not None:
+                if (
+                    is_main_process
+                    and on_batch_end is not None
+                    and (global_step % log_every == 0 or global_step == 1)
+                ):
                     batch_metrics = {
                         "epoch":       epoch_progress,
                         # --- Panel: Loss Components ---
@@ -1833,6 +2235,9 @@ class JEPATrainer(nn.Module):
                         # --- Panel: Representation Health ---
                         "std_dev_embeddings":  self._batch_mon.get("std_dev_embeddings", 0.0),
                         "rank_me":             self._batch_mon.get("rank_me", 0.0),
+                        "rank_me_updated":     float(
+                            self._batch_mon.get("rank_me_updated", 0.0)
+                        ),
                         "std_dev_values":      self._batch_mon.get("std_dev_values", 0.0),
                         "std_dev_times":       self._batch_mon.get("std_dev_times", 0.0),
                         # --- Panel: Medical Context ---
@@ -1867,6 +2272,7 @@ class JEPATrainer(nn.Module):
                     }
                     if self.config.masking_strategy == "causal_single":
                         for key in (
+                            "causal_valid_mask_fraction",
                             "causal_cut_position_ratio",
                             "causal_cut_over_context_index_span",
                             "causal_context_token_fraction",
@@ -2084,16 +2490,27 @@ class JEPATrainer(nn.Module):
                     hours_since_first = hours_since_first.to(device, non_blocking=True)
                 pre_mask = _pre_mask_dict_from_batch(batch)
 
-                _, _, l_total = self.forward(
-                    codes,
-                    attn_mask,
-                    values,
-                    z_scores,
-                    delta_times,
-                    value_mask,
-                    hours_since_first=hours_since_first,
-                    pre_mask=pre_mask,
+                use_amp = self.config.use_amp and device.type == "cuda"
+                amp_dtype = (
+                    torch.bfloat16
+                    if self.config.amp_dtype in ("bf16", "bfloat16")
+                    else torch.float16
                 )
+                with torch.autocast(
+                    device_type=device.type,
+                    dtype=amp_dtype,
+                    enabled=use_amp,
+                ):
+                    _, _, l_total = self.forward(
+                        codes,
+                        attn_mask,
+                        values,
+                        z_scores,
+                        delta_times,
+                        value_mask,
+                        hours_since_first=hours_since_first,
+                        pre_mask=pre_mask,
+                    )
                 total += l_total.item()
                 n += 1
 

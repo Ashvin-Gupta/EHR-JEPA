@@ -89,8 +89,8 @@ def load_config(path: str) -> dict:
         return yaml.safe_load(f)
 
 
-def set_seed(seed: int | None) -> None:
-    """Fix all random seeds for reproducibility, or do nothing if seed is None."""
+def set_seed(seed: int | None, *, cudnn_benchmark: bool = False) -> None:
+    """Fix random seeds.  cudnn_benchmark=True trades strict reproducibility for throughput."""
     if seed is None:
         print("[seed] No seed set — run is non-deterministic.")
         return
@@ -98,10 +98,27 @@ def set_seed(seed: int | None) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-    # Makes CUDA ops fully deterministic at a small speed cost
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    print(f"[seed] All random seeds fixed to {seed}.")
+    if cudnn_benchmark:
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        print(f"[seed] Seeds fixed to {seed}; cudnn.benchmark enabled (faster, less deterministic).")
+    else:
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+        print(f"[seed] All random seeds fixed to {seed} (deterministic cudnn).")
+
+
+def configure_cuda_performance(cfg: dict) -> None:
+    """Enable TF32 / matmul tuning when training on CUDA."""
+    if not torch.cuda.is_available():
+        return
+    tr = cfg.get("training", {})
+    if tr.get("tf32", True):
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        if hasattr(torch, "set_float32_matmul_precision"):
+            torch.set_float32_matmul_precision("high")
+        print("[perf] TF32 enabled for matmul / cudnn.")
 
 
 def _print_config(cfg: dict, config_path: str) -> None:
@@ -214,9 +231,6 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
         max_rs = int(mk.get("max_cutpoint_resamples", 64))
         masker: SpanMasker | CausalFutureMasker | CausalSingleCutMasker = CausalFutureMasker(
             num_cutpoints_S=mk.get("num_cutpoints_S", 4),
-            future_max_events=mk.get("future_max_events", 64),
-            future_max_hours=float(mk.get("future_max_hours", 12.0)),
-            context_chunk_mode=mk.get("context_chunk_mode", "full_prefix"),
             min_target_events=min_tgt_ev,
             max_cutpoint_resamples=max_rs,
         )
@@ -228,8 +242,6 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
             )
         )
         masker = CausalSingleCutMasker(
-            future_max_events=mk.get("future_max_events", 128),
-            future_max_hours=float(mk.get("future_max_hours", 6.0)),
             min_context_events=int(mk.get("min_context_events", 15)),
             min_target_events=min_tgt_ev,
             max_cutpoint_resamples=int(mk.get("max_cutpoint_resamples", 12)),
@@ -298,6 +310,13 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
         early_stopping_metric=tr.get("early_stopping_metric", "val_loss"),
         rank_me_every_n_steps=int(tr.get("rank_me_every_n_steps", 50)),
         rank_me_train_max_rows=int(tr.get("rank_me_train_max_rows", 256)),
+        use_amp=bool(tr.get("use_amp", True)) and torch.cuda.is_available(),
+        amp_dtype=str(tr.get("amp_dtype", "bf16")).lower(),
+        wandb_log_every_n_steps=int(tr.get("wandb_log_every_n_steps", 10)),
+        debug_jepa=bool(tr.get("debug_jepa", False)),
+        debug_jepa_first_batches=int(tr.get("debug_jepa_first_batches", 5)),
+        debug_jepa_every_n_steps=int(tr.get("debug_jepa_every_n_steps", 0)),
+        debug_jepa_on_zero_loss=bool(tr.get("debug_jepa_on_zero_loss", True)),
         checkpoint_dir=tr.get("checkpoint_dir", ""),
         n_epochs=tr.get("n_epochs", 10),
         device="cuda" if torch.cuda.is_available() else "cpu",
@@ -337,8 +356,9 @@ def build_loaders(
     task: str               = tr.get("task", "pretrain")
     cache_dir: str | None   = data_cfg.get("cache_dir", None)
     num_workers: int        = tr.get("num_workers", 4)
-    prefetch_factor: int    = int(tr.get("prefetch_factor", 2))
+    prefetch_factor: int    = int(tr.get("prefetch_factor", 4))
     pin_memory: bool        = bool(tr.get("pin_memory", True)) and torch.cuda.is_available()
+    encode_cache_size: int  = int(tr.get("encode_cache_size", 2048))
 
     if vocab is None:
         raise RuntimeError("vocab is required to encode sequences.")
@@ -357,6 +377,7 @@ def build_loaders(
             normalizer=normalizer,
             time_unit=time_unit,
             cache_dir=cache_dir,
+            encode_cache_size=encode_cache_size if task == "pretrain" else 0,
         )
 
     # Build the span masker and hand it to the collator so masking runs inside
@@ -377,16 +398,11 @@ def build_loaders(
             max_rs = int(mask_cfg.get("max_cutpoint_resamples", 64))
             collator_masker = CausalFutureMasker(
                 num_cutpoints_S=mask_cfg.get("num_cutpoints_S", 4),
-                future_max_events=mask_cfg.get("future_max_events", 64),
-                future_max_hours=float(mask_cfg.get("future_max_hours", 12.0)),
-                context_chunk_mode=mask_cfg.get("context_chunk_mode", "full_prefix"),
                 min_target_events=min_tgt_ev,
                 max_cutpoint_resamples=max_rs,
             )
         elif strat == "causal_single":
             collator_masker = CausalSingleCutMasker(
-                future_max_events=mask_cfg.get("future_max_events", 128),
-                future_max_hours=float(mask_cfg.get("future_max_hours", 6.0)),
                 min_context_events=int(mask_cfg.get("min_context_events", 15)),
                 min_target_events=min_tgt_ev,
                 max_cutpoint_resamples=int(mask_cfg.get("max_cutpoint_resamples", 12)),
@@ -425,9 +441,11 @@ def build_loaders(
     masking_loc = "worker (fast)" if collator_masker is not None else "main thread"
     mstr = cfg.get("masking", {}).get("strategy", "span_budget") if task == "pretrain" else "n/a"
     pf = prefetch_factor if num_workers > 0 else 0
+    enc_cache = encode_cache_size if task == "pretrain" else 0
     print(
         f"[data] num_workers={num_workers}  prefetch={pf}  "
-        f"pin_memory={pin_memory}  masking={masking_loc}  strategy={mstr}"
+        f"pin_memory={pin_memory}  encode_cache={enc_cache}  "
+        f"masking={masking_loc}  strategy={mstr}"
     )
 
     # With DDP, shuffle is handled by DistributedSampler (which must not be
@@ -812,7 +830,12 @@ def main(config_path: str, no_wandb: bool = False) -> None:
 
     # 0b. Seed — offset per rank so each process sees a different data order
     base_seed = cfg.get("seed", None)
-    set_seed(None if base_seed is None else base_seed + rank)
+    tr_cfg = cfg.get("training", {})
+    set_seed(
+        None if base_seed is None else base_seed + rank,
+        cudnn_benchmark=bool(tr_cfg.get("cudnn_benchmark", True)),
+    )
+    configure_cuda_performance(cfg)
 
     # 1. Print full config (rank 0 only)
     if is_main:

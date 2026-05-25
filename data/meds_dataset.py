@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import math
 import os
+from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -99,6 +100,7 @@ class MEDSDataset(Dataset):
         time_unit: str = "hours",
         cache_dir: Optional[str] = None,
         max_files: Optional[int] = None,
+        encode_cache_size: int = 0,
     ):
         if task not in ("pretrain", "prediction"):
             raise ValueError(f"task must be 'pretrain' or 'prediction', got '{task}'")
@@ -110,6 +112,8 @@ class MEDSDataset(Dataset):
         self.max_seq_len = max_seq_len
         self.normalizer = normalizer
         self.time_unit = time_unit
+        self._enc_cache_max = max(0, int(encode_cache_size))
+        self._enc_cache: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
 
         # Load the full split as a polars DataFrame + a tiny row index dict.
         # No Python Event objects are created here — they are built lazily
@@ -255,6 +259,17 @@ class MEDSDataset(Dataset):
             "delta_times": self._compute_delta_times(events),
         }
 
+    def _get_encoded_pretrain(self, subject_id: int) -> Dict[str, Any]:
+        """LRU cache of encoded dicts — avoids re-vocabulating the same subject."""
+        if subject_id in self._enc_cache:
+            self._enc_cache.move_to_end(subject_id)
+            return self._enc_cache[subject_id]
+        enc = self._encode_events(self._get_events(subject_id))
+        self._enc_cache[subject_id] = enc
+        if len(self._enc_cache) > self._enc_cache_max:
+            self._enc_cache.popitem(last=False)
+        return enc
+
     # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
@@ -274,7 +289,10 @@ class MEDSDataset(Dataset):
             events = self._apply_time_cutoff(events, sample["prediction_time"])
             events = self._truncate_with_header(events)
 
-        encoded = self._encode_events(events)
+        if self.task == "pretrain" and self._enc_cache_max > 0:
+            encoded = self._get_encoded_pretrain(subject_id)
+        else:
+            encoded = self._encode_events(events)
         return {
             "subject_id": subject_id,
             "label":      label,
