@@ -113,7 +113,7 @@ class MEDSDataset(Dataset):
         self.normalizer = normalizer
         self.time_unit = time_unit
         self._enc_cache_max = max(0, int(encode_cache_size))
-        self._enc_cache: "OrderedDict[int, Dict[str, Any]]" = OrderedDict()
+        self._enc_cache: "OrderedDict[Any, Dict[str, Any]]" = OrderedDict()
 
         # Load the full split as a polars DataFrame + a tiny row index dict.
         # No Python Event objects are created here — they are built lazily
@@ -259,17 +259,6 @@ class MEDSDataset(Dataset):
             "delta_times": self._compute_delta_times(events),
         }
 
-    def _get_encoded_pretrain(self, subject_id: int) -> Dict[str, Any]:
-        """LRU cache of encoded dicts — avoids re-vocabulating the same subject."""
-        if subject_id in self._enc_cache:
-            self._enc_cache.move_to_end(subject_id)
-            return self._enc_cache[subject_id]
-        enc = self._encode_events(self._get_events(subject_id))
-        self._enc_cache[subject_id] = enc
-        if len(self._enc_cache) > self._enc_cache_max:
-            self._enc_cache.popitem(last=False)
-        return enc
-
     # ------------------------------------------------------------------
     # Dataset interface
     # ------------------------------------------------------------------
@@ -277,22 +266,48 @@ class MEDSDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def _get_encoded_cached(self, cache_key: Any, events: List[Event]) -> Dict[str, Any]:
+        """LRU cache lookup; builds + inserts on miss."""
+        if cache_key in self._enc_cache:
+            self._enc_cache.move_to_end(cache_key)
+            return self._enc_cache[cache_key]
+        enc = self._encode_events(events)
+        self._enc_cache[cache_key] = enc
+        if len(self._enc_cache) > self._enc_cache_max:
+            self._enc_cache.popitem(last=False)
+        return enc
+
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         sample     = self.samples[idx]
         subject_id = sample["subject_id"]
         label      = sample["label"]
 
-        # Lazy: convert only this subject's ~200 rows to Events
-        events = self._get_events(subject_id)
-
-        if self.task == "prediction":
-            events = self._apply_time_cutoff(events, sample["prediction_time"])
-            events = self._truncate_with_header(events)
-
-        if self.task == "pretrain" and self._enc_cache_max > 0:
-            encoded = self._get_encoded_pretrain(subject_id)
+        if self._enc_cache_max > 0:
+            if self.task == "pretrain":
+                cache_key = subject_id
+                if cache_key in self._enc_cache:
+                    self._enc_cache.move_to_end(cache_key)
+                    encoded = self._enc_cache[cache_key]
+                else:
+                    events = self._get_events(subject_id)
+                    encoded = self._get_encoded_cached(cache_key, events)
+            else:
+                cache_key = (subject_id, sample.get("prediction_time"))
+                if cache_key in self._enc_cache:
+                    self._enc_cache.move_to_end(cache_key)
+                    encoded = self._enc_cache[cache_key]
+                else:
+                    events = self._get_events(subject_id)
+                    events = self._apply_time_cutoff(events, sample["prediction_time"])
+                    events = self._truncate_with_header(events)
+                    encoded = self._get_encoded_cached(cache_key, events)
         else:
+            events = self._get_events(subject_id)
+            if self.task == "prediction":
+                events = self._apply_time_cutoff(events, sample["prediction_time"])
+                events = self._truncate_with_header(events)
             encoded = self._encode_events(events)
+
         return {
             "subject_id": subject_id,
             "label":      label,

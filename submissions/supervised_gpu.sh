@@ -1,11 +1,14 @@
 #!/bin/bash
 # Usage:
-#   sbatch submissions/supervised_gpu.sh [TASK]
-#   sbatch --job-name=sup-jepa-hosp submissions/supervised_gpu.sh hospital_mortality
+#   sbatch submissions/supervised_gpu.sh [TASK] [CHECKPOINT]
+#   sbatch --job-name=sup-jepa-hosp submissions/supervised_gpu.sh hospital_mortality /path/to/your/checkpoint.pt
 #
 # TASK (optional) overrides data.labels_task in the config, e.g.:
 #   icu_mortality | hospital_mortality | hospital_readmission
 # If omitted, the value from configs/ehr_config.yaml is used.
+#
+# CHECKPOINT (optional) overrides the default checkpoint path.
+# If omitted, the default last.pt is used.
 
 #SBATCH --time=24:00:00
 #SBATCH --nodes=1
@@ -35,16 +38,27 @@ export PYTHONPATH="${BASE_DIR}:${PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 
 TASK="${1:-}"
+CHECKPOINT="${2:-/home/ag619/EHR-JEPA-Data/Fri22ndMaycausal_single/checkpoints/last.pt}"
 
 echo "Job ID:   ${SLURM_JOB_ID}"
 echo "Log file: logs/Supervised/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
 
-PYTHON_ARGS=(--config configs/ehr_config.yaml)
+PYTHON_ARGS=(
+  --config configs/ehr_config.yaml
+  --checkpoint "${CHECKPOINT}"
+)
+
 if [[ -n "${TASK}" ]]; then
   PYTHON_ARGS+=(--task "${TASK}")
   echo "Task: ${TASK} (overrides data.labels_task)"
 else
   echo "Task: from config (data.labels_task)"
+fi
+
+if [[ -n "${2}" ]]; then
+  echo "Checkpoint: ${CHECKPOINT} (overrides default)"
+else
+  echo "Checkpoint: default (${CHECKPOINT})"
 fi
 
 python main_supervised_downstream.py "${PYTHON_ARGS[@]}"

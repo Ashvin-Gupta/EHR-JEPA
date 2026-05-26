@@ -47,6 +47,7 @@ from torch.utils.data import DataLoader
 
 from loss.covariance_reg import SIGRegLoss
 from loss.jepa_loss import (
+    causal_ar_prediction_loss,
     future_time_decay_weights,
     jepa_prediction_loss,
     jepa_prediction_loss_token_masked,
@@ -92,67 +93,6 @@ def _pre_mask_dict_from_batch(batch: Dict) -> Optional[Dict]:
     return None
 
 
-def _compute_causal_single_monitoring(
-    all_context_indices: List[List[int]],
-    all_target_spans: List[List[List[int]]],
-    cutpoints: Optional[List[int]] = None,
-    context_starts: Optional[List[int]] = None,
-) -> Dict[str, float]:
-    """
-    Causal-single mask geometry for W&B (two-index design).
-
-    Active region [s, e] with cut t: context [s,t], target (t,e].
-
-    causal_cut_position_ratio:
-        (t - s) / (e - s) — split point along the active window.
-
-    causal_cut_over_context_index_span:
-        (t - s + 1) / (e - s + 1) — share of active index range used as context.
-
-    causal_context_token_fraction / causal_target_token_fraction:
-        |context| / (|context|+|target|) and complement.
-    """
-    cut_positions: List[float] = []
-    cut_over_ctx: List[float] = []
-    ctx_fracs: List[float] = []
-    tgt_fracs: List[float] = []
-
-    for b, ctx in enumerate(all_context_indices):
-        if not ctx:
-            continue
-        spans = all_target_spans[b] if b < len(all_target_spans) else [[]]
-        tgt_flat: List[int] = []
-        for sp in spans:
-            tgt_flat.extend(sp)
-        tgt_set = set(tgt_flat)
-        s = min(ctx)
-        if context_starts is not None and b < len(context_starts) and context_starts[b] >= 0:
-            s = int(context_starts[b])
-        t = max(ctx)
-        if cutpoints is not None and b < len(cutpoints) and cutpoints[b] >= 0:
-            t = int(cutpoints[b])
-        e = max(max(ctx), max(tgt_set) if tgt_set else max(ctx))
-
-        n_ctx = len(ctx)
-        n_tgt = len(tgt_set)
-        denom = max(n_ctx + n_tgt, 1)
-        ctx_fracs.append(n_ctx / denom)
-        tgt_fracs.append(n_tgt / denom)
-
-        active_span = max(e - s, 1)
-        cut_positions.append((t - s) / float(active_span))
-        active_index_len = e - s + 1
-        cut_over_ctx.append((t - s + 1) / float(max(active_index_len, 1)))
-
-    def _mean(xs: List[float]) -> float:
-        return sum(xs) / len(xs) if xs else 0.0
-
-    return {
-        "causal_cut_position_ratio": _mean(cut_positions),
-        "causal_cut_over_context_index_span": _mean(cut_over_ctx),
-        "causal_context_token_fraction": _mean(ctx_fracs),
-        "causal_target_token_fraction": _mean(tgt_fracs),
-    }
 
 
 def _zero_loss_connected(t: torch.Tensor) -> torch.Tensor:
@@ -179,7 +119,6 @@ def _format_forward_debug(dbg: Dict) -> str:
         "avg_nt",
         "l_pred",
         "l_cov",
-        "rank_me_recomputed",
         "rank_me",
     ):
         if key in dbg:
@@ -333,8 +272,13 @@ class TrainerConfig:
     debug_jepa_every_n_steps: int = 0
     debug_jepa_on_zero_loss: bool = True
 
-    # masking.strategy from YAML ("span_budget" | "causal_single" | "causal_future").
-    # causal_single uses span batch keys (one cut); causal_future uses multi-cut keys.
+    # Prediction loss distance: "mse" (L2, default) | "smooth_l1" (Huber).
+    # Applied to all JEPA paradigms (span_budget, causal_single, causal_future,
+    # causal_autoregressive).
+    pred_loss_type: str = "mse"
+
+    # masking.strategy from YAML.
+    # "span_budget" | "causal_single" | "causal_future" | "causal_autoregressive"
     masking_strategy: str = "span_budget"
 
     # Inline linear probe pooling when not using perceiver: "cls" | "mean_pool"
@@ -479,7 +423,6 @@ class JEPATrainer(nn.Module):
         print(
             f"  mon: avg_ctx={mon.get('avg_context_length', 0):.2f} "
             f"avg_tgt={mon.get('avg_target_span_length', 0):.2f} "
-            f"valid_mask_frac={mon.get('causal_valid_mask_fraction', float('nan')):.3f} "
             f"std_dev={mon.get('std_dev_embeddings', 0):.4f} "
             f"rank_me={mon.get('rank_me', 0):.1f} "
             f"N_in={mon.get('_N_input', 0)} N_tgt={mon.get('_N_target', 0)}",
@@ -581,6 +524,11 @@ class JEPATrainer(nn.Module):
             hours_since_first = torch.arange(
                 L, device=device, dtype=torch.float
             ).unsqueeze(0).expand(B, -1)
+
+        if self.masking_strategy == "causal_autoregressive":
+            return self._forward_causal_autoregressive(
+                x, attention_mask, device, _std_values, _std_times,
+            )
 
         if pre_mask is not None and "mask_causal_contexts" in pre_mask:
             return self._forward_causal_multi_cut(
@@ -722,11 +670,6 @@ class JEPATrainer(nn.Module):
                 "avg_context_length": avg_ctx_len,
                 "avg_target_span_length": avg_tgt_area,
             }
-            if self.config.masking_strategy == "causal_single":
-                n_ok = sum(1 for n in num_spans_per_sample if n > 0)
-                self._batch_mon["causal_valid_mask_fraction"] = n_ok / max(
-                    B_size_pre, 1
-                )
             return z, z, z
 
         all_target_spans = [spans[:num_spans] for spans in all_target_spans]
@@ -828,26 +771,14 @@ class JEPATrainer(nn.Module):
                 rank_me = self._last_rank_me
 
         # Raw token counts — use full-mask totals (see N_target_full above).
-        # Ratios in train loop: target_ratio = N_target_full / N_input,
-        # context_ratio = N_context_full / sum(N_sequence) (per-batch).
-
-        rank_recomputed = bool(
-            target_spans_list
-            and self.config.rank_me_every_n_steps > 0
-            and self._cov_global_step % self.config.rank_me_every_n_steps == 0
-        )
+        # Ratios in train loop: target_ratio = N_target / N_model,
+        # context_ratio = N_context / N_total (per-batch sums).
 
         self._batch_mon = {
             "std_dev_embeddings":     std_dev,
             "rank_me":                rank_me,
-            "rank_me_updated":        rank_recomputed,
-            # Feature std-devs (0.0 when feature is disabled):
-            #   std_dev_values = std of z_scores (should be ~1 if normalizer healthy)
-            #   std_dev_times  = std of log(1+hours) (should be ~1)
             "std_dev_values":         _std_values,
             "std_dev_times":          _std_times,
-            # Batch sums: N_input = real tokens in window; N_target/N_context from
-            # full span mask (not truncated to min(num_spans) used in forward).
             "_N_input":               N_model_pre,
             "_N_target":              N_target_full,
             "_N_context":             N_context_full,
@@ -859,23 +790,11 @@ class JEPATrainer(nn.Module):
                 else None
             ),
         }
-        if self.config.masking_strategy == "causal_single":
-            n_ok = sum(1 for n in num_spans_per_sample if n > 0)
-            self._batch_mon["causal_valid_mask_fraction"] = n_ok / max(B_size_pre, 1)
-            self._batch_mon.update(
-                _compute_causal_single_monitoring(
-                    all_context_indices,
-                    all_target_spans,
-                    cutpoints=mask_cutpoints,
-                    context_starts=mask_context_starts,
-                )
-            )
 
         self._dbg(
             l_pred=float(l_pred.detach().item()),
             l_cov=float(l_cov.detach().item()),
             l_total_requires_grad=bool(l_total.requires_grad),
-            rank_me_recomputed=rank_recomputed,
             rank_me=float(rank_me),
         )
         if float(l_pred.detach().item()) == 0.0 and float(l_cov.detach().item()) == 0.0:
@@ -1037,6 +956,130 @@ class JEPATrainer(nn.Module):
                 else None
             ),
         }
+
+        return l_pred, l_cov, l_total
+
+    # ------------------------------------------------------------------
+    # Causal Autoregressive forward
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_causal_attn_bias(
+        L: int, device: torch.device,
+    ) -> torch.Tensor:
+        """(L, L) additive mask: 0 = attend, -inf = block (upper triangle)."""
+        mask = torch.triu(torch.ones(L, L, device=device), diagonal=1)
+        return mask.masked_fill(mask.bool(), float("-inf"))
+
+    def _forward_causal_autoregressive(
+        self,
+        x: torch.Tensor,
+        attention_mask: torch.Tensor,
+        device: torch.device,
+        _std_values: float,
+        _std_times: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """
+        Causal autoregressive JEPA: predict next token in embedding space.
+
+        1. Target pass  — bidirectional encoder on [CLS | events].
+        2. Context pass — same encoder with causal mask on [CLS | events].
+        3. Predictor    — token_predictor with causal mask on context (no CLS).
+        4. Loss         — shifted-by-1: y_hat[:-1] vs y_tgt[1:].
+        """
+        B, L = attention_mask.shape
+        d = x.shape[-1]
+
+        # --- 1. Target pass (bidirectional) ---
+        target_enc_out = encode_embeddings_with_cls(
+            self.encoder, self.cls_token, x, attention_mask,
+        )  # (B, L+1, d)
+        y_tgt = target_enc_out[:, 1:, :]  # (B, L, d) — strip CLS
+
+        # --- 2. Context pass (causal) ---
+        cls_exp = self.cls_token.view(1, 1, -1).expand(B, 1, -1)
+        x_cls = torch.cat([cls_exp, x], dim=1)  # (B, L+1, d)
+        cls_mask_col = attention_mask.new_ones(B, 1)
+        full_mask = torch.cat([cls_mask_col, attention_mask], dim=1)  # (B, L+1)
+
+        causal_bias_enc = self._build_causal_attn_bias(L + 1, device)  # (L+1, L+1)
+
+        context_enc_out = self.encoder(
+            x_cls,
+            attention_mask=full_mask,
+            attn_bias=causal_bias_enc,
+        )  # (B, L+1, d)
+        c = context_enc_out[:, 1:, :]  # (B, L, d) — strip CLS
+
+        # --- 3. Predictor pass (causal) ---
+        causal_bias_pred = self._build_causal_attn_bias(L, device)  # (L, L)
+
+        y_hat = self.token_predictor(
+            c,
+            attention_mask=attention_mask,
+            attn_bias=causal_bias_pred,
+        )  # (B, L, d)
+
+        # --- 4. Projection heads ---
+        y_hat, y_tgt_proj = self._proj_token_targets(y_hat, y_tgt)
+
+        # --- 5. Prediction loss (shifted by 1) ---
+        l_pred = causal_ar_prediction_loss(
+            y_hat, y_tgt_proj, attention_mask,
+            loss_type=self.config.pred_loss_type,
+        )
+
+        # --- 6. SIGReg on target embeddings ---
+        real_mask = attention_mask.bool()
+        n_real = int(real_mask.sum().item())
+        if n_real >= 2:
+            y_cov = y_tgt_proj[real_mask]
+            l_cov = self.cov_loss(
+                y_cov,
+                global_step=self._cov_global_step,
+                sync_ddp=self._cov_sync_ddp,
+            )
+        else:
+            l_cov = y_tgt_proj.sum() * 0.0
+
+        l_total = l_pred + self.config.lambda_cov * l_cov
+
+        # --- Monitoring ---
+        with torch.no_grad():
+            y_real = y_tgt[real_mask]
+            std_dev = y_real.detach().float().std(dim=0).mean().item() if n_real > 0 else 0.0
+            every = self.config.rank_me_every_n_steps
+            if every > 0 and self._cov_global_step % every == 0 and n_real >= 2:
+                n_sample = min(n_real, self.config.rank_me_train_max_rows)
+                idx = torch.randperm(n_real, device=device)[:n_sample]
+                rank_me = _rank_me_from_rows(y_real[idx].detach())
+                self._last_rank_me = rank_me
+            else:
+                rank_me = self._last_rank_me
+
+            n_pairs = int(
+                (attention_mask[:, :-1] * attention_mask[:, 1:]).sum().item()
+            )
+
+        self._batch_mon = {
+            "std_dev_embeddings": std_dev,
+            "rank_me": rank_me,
+            "std_dev_values": _std_values,
+            "std_dev_times": _std_times,
+            "_N_input": n_real,
+            "_N_target": n_pairs,
+            "_N_context": n_real,
+            "avg_context_length": float(attention_mask.sum(1).float().mean().item()),
+            "avg_target_span_length": float(n_pairs) / max(B, 1),
+        }
+
+        self._dbg(
+            l_pred=float(l_pred.detach().item()),
+            l_cov=float(l_cov.detach().item()),
+            l_total_requires_grad=bool(l_total.requires_grad),
+            rank_me=float(rank_me),
+            n_prediction_pairs=n_pairs,
+        )
 
         return l_pred, l_cov, l_total
 
@@ -1203,7 +1246,9 @@ class JEPATrainer(nn.Module):
             if self.pred_proj is not None:
                 Z_hat = self.pred_proj(Z_hat)
 
-            pred_losses.append(jepa_prediction_loss(Z_hat, Z_tgt))
+            pred_losses.append(jepa_prediction_loss(
+                Z_hat, Z_tgt, loss_type=self.config.pred_loss_type,
+            ))
             cov_losses.append(
                 self.cov_loss(
                     Z_tgt,
@@ -1581,10 +1626,14 @@ class JEPATrainer(nn.Module):
 
         if use_time_decay:
             l_pred = jepa_prediction_loss_token_masked(
-                y_hat, y_tgt, token_mask, weights=loss_weights
+                y_hat, y_tgt, token_mask, weights=loss_weights,
+                loss_type=self.config.pred_loss_type,
             )
         else:
-            l_pred = jepa_prediction_loss_token_masked(y_hat, y_tgt, token_mask)
+            l_pred = jepa_prediction_loss_token_masked(
+                y_hat, y_tgt, token_mask,
+                loss_type=self.config.pred_loss_type,
+            )
 
         if not torch.isfinite(l_pred):
             self._dbg(zero_path="causal_single_nonfinite_l_pred")
@@ -1675,10 +1724,15 @@ class JEPATrainer(nn.Module):
                     device,
                 )
                 pred_losses.append(
-                    jepa_prediction_loss_weighted(y_hat, y_tgt, weights)
+                    jepa_prediction_loss_weighted(
+                        y_hat, y_tgt, weights,
+                        loss_type=self.config.pred_loss_type,
+                    )
                 )
             else:
-                pred_losses.append(jepa_prediction_loss(y_hat, y_tgt))
+                pred_losses.append(jepa_prediction_loss(
+                    y_hat, y_tgt, loss_type=self.config.pred_loss_type,
+                ))
             cov_losses.append(
                 self.cov_loss(
                     y_tgt,
@@ -2235,14 +2289,9 @@ class JEPATrainer(nn.Module):
                         # --- Panel: Representation Health ---
                         "std_dev_embeddings":  self._batch_mon.get("std_dev_embeddings", 0.0),
                         "rank_me":             self._batch_mon.get("rank_me", 0.0),
-                        "rank_me_updated":     float(
-                            self._batch_mon.get("rank_me_updated", 0.0)
-                        ),
                         "std_dev_values":      self._batch_mon.get("std_dev_values", 0.0),
                         "std_dev_times":       self._batch_mon.get("std_dev_times", 0.0),
                         # --- Panel: Medical Context ---
-                        # N_total: original trajectory length (pre-windowing)
-                        # N_context / N_target: computed after masking
                         "avg_seq_length": (
                             orig_seq_lengths.float().mean().item()
                             if orig_seq_lengths is not None
@@ -2250,13 +2299,14 @@ class JEPATrainer(nn.Module):
                         ),
                         "avg_context_length":    self._batch_mon.get("avg_context_length", 0.0),
                         "avg_target_span_length": self._batch_mon.get("avg_target_span_length", 0.0),
-                        # Definitions (batch-level sums):
-                        #   N_input    = real tokens after windowing/padding
-                        #   N_targets  = masked tokens
-                        #   N_context  = N_input - N_targets
+                        # --- Panel: Masking Ratios ---
+                        #   N_total  = original patient sequence length (pre-windowing)
+                        #   N_model  = real tokens in the model window (≤ max_seq_len)
+                        #   N_target = masked target tokens
+                        #   N_context = N_model - N_target
                         #
-                        #   target_ratio  = N_targets / N_input
-                        #   context_ratio = N_context / N_full_sequence
+                        #   target_ratio  = N_target / N_model
+                        #   context_ratio = N_context / N_total
                         "target_ratio": (
                             self._batch_mon.get("_N_target", 0)
                             / max(self._batch_mon.get("_N_input", 1), 1)
@@ -2270,16 +2320,6 @@ class JEPATrainer(nn.Module):
                             )
                         ),
                     }
-                    if self.config.masking_strategy == "causal_single":
-                        for key in (
-                            "causal_valid_mask_fraction",
-                            "causal_cut_position_ratio",
-                            "causal_cut_over_context_index_span",
-                            "causal_context_token_fraction",
-                            "causal_target_token_fraction",
-                        ):
-                            if key in self._batch_mon:
-                                batch_metrics[key] = self._batch_mon[key]
                     on_batch_end(epoch, global_step, batch_metrics)
 
             avg_train  = epoch_loss   / max(n_batches, 1)

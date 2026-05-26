@@ -246,6 +246,12 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
             min_target_events=min_tgt_ev,
             max_cutpoint_resamples=int(mk.get("max_cutpoint_resamples", 12)),
         )
+    elif mask_strategy == "causal_autoregressive":
+        masker = SpanMasker(
+            mask_ratio=0.0,
+            default_num_spans=1,
+            min_span_length=1,
+        )
     else:
         masker = SpanMasker(
             mask_ratio=mk.get("mask_ratio", 0.30),
@@ -299,6 +305,7 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
         causal_single_predictor_attn=str(
             p.get("causal_single_attn", "bidirectional")
         ).lower(),
+        pred_loss_type=str(lc.get("pred_loss_type", "mse")).lower(),
         masking_strategy=mask_strategy,
         lr=tr.get("lr", 1e-4),
         weight_decay=tr.get("weight_decay", 1e-2),
@@ -377,7 +384,7 @@ def build_loaders(
             normalizer=normalizer,
             time_unit=time_unit,
             cache_dir=cache_dir,
-            encode_cache_size=encode_cache_size if task == "pretrain" else 0,
+            encode_cache_size=encode_cache_size,
         )
 
     # Build the span masker and hand it to the collator so masking runs inside
@@ -394,7 +401,9 @@ def build_loaders(
                 p_cfg.get("min_span_for_perceiver", mask_cfg.get("min_span_length", 15)),
             )
         )
-        if strat == "causal_future":
+        if strat == "causal_autoregressive":
+            pass
+        elif strat == "causal_future":
             max_rs = int(mask_cfg.get("max_cutpoint_resamples", 64))
             collator_masker = CausalFutureMasker(
                 num_cutpoints_S=mask_cfg.get("num_cutpoints_S", 4),
@@ -441,7 +450,7 @@ def build_loaders(
     masking_loc = "worker (fast)" if collator_masker is not None else "main thread"
     mstr = cfg.get("masking", {}).get("strategy", "span_budget") if task == "pretrain" else "n/a"
     pf = prefetch_factor if num_workers > 0 else 0
-    enc_cache = encode_cache_size if task == "pretrain" else 0
+    enc_cache = encode_cache_size
     print(
         f"[data] num_workers={num_workers}  prefetch={pf}  "
         f"pin_memory={pin_memory}  encode_cache={enc_cache}  "
@@ -961,11 +970,11 @@ def main(config_path: str, no_wandb: bool = False) -> None:
     #
     # Panel layout the user can configure in W&B:
     #   "Loss Components"         — train/loss_*, val/loss_total
-    #   "Representation Health"   — train/std_dev_embeddings, val/rank_me
+    #   "Representation Health"   — train/std_dev_embeddings, train/rank_me, val/rank_me
     #   "Optimization & Hardware" — train/learning_rate, train/grad_norm,
     #                               train/samples_per_second
-    #   "Medical Context"         — train/mask_ratio, train/avg_seq_length,
-    #                               val/unique_codes_seen
+    #   "Medical Context"         — train/avg_seq_length, train/avg_context_length
+    #   "Masking Ratios"          — train/target_ratio, train/context_ratio
 
     def on_batch_end(epoch: int, global_step: int, metrics: dict) -> None:
         if run is not None:

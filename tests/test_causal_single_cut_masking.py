@@ -8,7 +8,6 @@ import pytest
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from masking.causal_single_cut_masking import CausalSingleCutMasker
-from training.trainer import _compute_causal_single_monitoring
 
 
 def _hours_linear(n: int) -> list[float]:
@@ -160,17 +159,6 @@ def test_cutpoint_index_matches_context_end():
         return
     assert r.cutpoint_index is not None
     assert r.cutpoint_index == max(r.context_indices)
-
-
-def test_causal_single_monitoring_metrics():
-    ctx = [list(range(5, 20))]
-    tgt = [[list(range(21, 35))]]
-    m = _compute_causal_single_monitoring(
-        ctx, tgt, cutpoints=[19], context_starts=[5]
-    )
-    assert m["causal_cut_position_ratio"] == pytest.approx((19 - 5) / (34 - 5))
-    assert m["causal_context_token_fraction"] == pytest.approx(15 / 29)
-    assert m["causal_target_token_fraction"] == pytest.approx(14 / 29)
 
 
 def test_padding_positions_ignored():

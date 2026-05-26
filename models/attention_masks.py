@@ -56,16 +56,16 @@ def build_causal_single_structured_mask(
     if compact == 0:
         return mask
 
-    off = n_cls  # context starts here
+    off = n_cls
     ctx_end = off + n_ctx
     tgt_end = ctx_end + n_tgt
 
     if ctx_causal:
-        # Top-left block: lower-triangular on [CLS | context] in compact order.
         top = ctx_end
-        for i in range(top):
-            for j in range(i + 1):
-                mask[i, j] = 0.0
+        if top > 0:
+            row_idx = torch.arange(top, device=device)
+            causal = row_idx.unsqueeze(1) >= row_idx.unsqueeze(0)
+            mask[:top, :top].masked_fill_(causal, 0.0)
     else:
         if include_cls:
             mask[0, 0] = 0.0
@@ -140,24 +140,54 @@ def build_causal_single_structured_mask_batch(
     device: torch.device | str,
     dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
-    """Stack per-row (L, L) masks → (B, max_len, max_len)."""
+    """Batched (B, max_len, max_len) mask — fully vectorized."""
     if len(lengths_c) != len(lengths_t):
         raise ValueError("lengths_c and lengths_t must have the same length")
     B = len(lengths_c)
     if B == 0:
         return torch.zeros(0, max_len, max_len, device=device, dtype=dtype)
 
+    n_cls = 1 if include_cls else 0
+    lc = torch.tensor(lengths_c, device=device, dtype=torch.long)
+    lt = torch.tensor(lengths_t, device=device, dtype=torch.long)
+    ctx_end = n_cls + lc
+    tgt_end = ctx_end + lt
+
     out = torch.full((B, max_len, max_len), float("-inf"), device=device, dtype=dtype)
+    idx = torch.arange(max_len, device=device)
+
+    max_ce = int(ctx_end.max().item()) if B > 0 else 0
+    if ctx_causal and max_ce > 0:
+        r = torch.arange(max_ce, device=device)
+        causal_template = r.unsqueeze(1) >= r.unsqueeze(0)
+
     for b in range(B):
-        out[b] = build_causal_single_structured_mask(
-            int(lengths_c[b]),
-            int(lengths_t[b]),
-            include_cls=include_cls,
-            ctx_causal=ctx_causal,
-            max_len=max_len,
-            device=device,
-            dtype=dtype,
-        )
+        ce = int(ctx_end[b])
+        te = int(tgt_end[b])
+        nc = int(lc[b])
+        off = n_cls
+
+        if ctx_causal:
+            if ce > 0:
+                out[b, :ce, :ce].masked_fill_(causal_template[:ce, :ce], 0.0)
+        else:
+            if include_cls:
+                out[b, 0, 0] = 0.0
+                if nc > 0:
+                    out[b, 0, off:ce] = 0.0
+            if nc > 0:
+                if include_cls:
+                    out[b, off:ce, 0] = 0.0
+                out[b, off:ce, off:ce] = 0.0
+
+        if nc > 0 and te > ce:
+            out[b, ce:te, off:ce] = 0.0
+        if te > ce:
+            if include_cls:
+                out[b, ce:te, 0] = 0.0
+            tgt_idx = idx[ce:te]
+            out[b, tgt_idx, tgt_idx] = 0.0
+
     return out
 
 

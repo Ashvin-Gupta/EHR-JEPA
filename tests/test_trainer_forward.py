@@ -628,7 +628,6 @@ def test_causal_single_mixed_valid_invalid_batch_not_zeroed():
     assert l_total.item() > 0.0
     assert trainer._batch_mon["avg_context_length"] > 0.0
     assert trainer._batch_mon["avg_target_span_length"] > 0.0
-    assert trainer._batch_mon["causal_valid_mask_fraction"] == 0.75
 
 
 def test_causal_single_hours_since_first_affects_loss():
