@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --output=/home/ag619/EHR-JEPA/logs/Supervised/%x_%j.log
+#SBATCH --output=logs/Supervised/%x_%j.log
 #SBATCH --job-name=sup-ar
 
 # Usage:
@@ -16,7 +16,7 @@
 
 set -e
 
-BASE_DIR="/home/ag619/EHR-JEPA"
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 export WANDB_API_KEY="3256683a0a9a004cf52e04107a3071099a53038e"
 
@@ -24,7 +24,6 @@ cd "${BASE_DIR}"
 echo "Activating virtual environment..."
 source .venv/bin/activate
 
-export PYTHONPATH="${BASE_DIR}:${PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 
 TASK="${1:-}"
@@ -34,7 +33,7 @@ echo "Log file: logs/Supervised/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
 
 PYTHON_ARGS=(
   --config configs/ar_config.yaml
-  --checkpoint /home/ag619/EHR-JEPA-Data/ar_checkpoints/best.pt
+  --checkpoint "${DATA_DIR}/ar_checkpoints/best.pt"
 )
 if [[ -n "${TASK}" ]]; then
   PYTHON_ARGS+=(--task "${TASK}")

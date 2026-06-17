@@ -5,7 +5,7 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --output=/home/ag619/EHR-JEPA/logs/Supervised/%x_%j.log
+#SBATCH --output=logs/Supervised/%x_%j.log
 #SBATCH --job-name=sup-bert
 
 
@@ -20,8 +20,7 @@
 
 set -e
 
-# Set the base directory for your project
-BASE_DIR="/home/ag619/EHR-JEPA"
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 export WANDB_API_KEY="3256683a0a9a004cf52e04107a3071099a53038e"
 
@@ -31,8 +30,6 @@ cd "${BASE_DIR}"
 echo "Activating virtual environment..."
 source .venv/bin/activate
 
-
-export PYTHONPATH="${BASE_DIR}:${PYTHONPATH}"
 # Disable Python output buffering so the log file updates in real-time
 export PYTHONUNBUFFERED=1
 
@@ -43,7 +40,7 @@ echo "Log file: logs/Supervised/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
 
 PYTHON_ARGS=(
   --config configs/bert_config.yaml
-  --checkpoint /home/ag619/EHR-JEPA-Data/bert_checkpoints/6_layer_256/best.pt
+  --checkpoint "${DATA_DIR}/bert_checkpoints/6_layer_256/best.pt"
 )
 if [[ -n "${TASK}" ]]; then
   PYTHON_ARGS+=(--task "${TASK}")

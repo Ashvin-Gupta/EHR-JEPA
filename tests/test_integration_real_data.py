@@ -9,7 +9,7 @@ Run with:
 or:
     pytest tests/test_integration_real_data.py -v -s
 
-DATA_DIR defaults to /home/ag619/clean_meds_debug but can be overridden:
+DATA_DIR defaults to ../clean_meds_debug (sibling of EHR-JEPA) but can be overridden:
     DATA_DIR=/other/path pytest tests/test_integration_real_data.py -v -s
 """
 
@@ -19,8 +19,10 @@ from typing import List
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-DATA_DIR   = os.environ.get("DATA_DIR",   "/home/ag619/clean_meds_debug")
-LOOKUP_DIR = os.environ.get("LOOKUP_DIR", "/home/ag619/MIMIC_data/hosp")
+from paths import MIMIC_DATA, WORKSPACE_ROOT
+
+DATA_DIR   = os.environ.get("DATA_DIR",   str(WORKSPACE_ROOT / "clean_meds_debug"))
+LOOKUP_DIR = os.environ.get("LOOKUP_DIR", str(MIMIC_DATA / "hosp"))
 
 import numpy as np
 import pandas as pd

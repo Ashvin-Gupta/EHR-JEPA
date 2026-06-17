@@ -6,12 +6,12 @@
 seed: 42
 
 data:
-  data_dir: "/home/ag619/clean_meds"
-  lookup_dir: "/home/ag619/MIMIC_data/hosp"
-  vocab_path: "/home/ag619/EHR-JEPA-Data/vocab.json"
-  labels_base_dir: "/home/ag619/EHR-JEPA-Data/labels"
+  data_dir: "../clean_meds"
+  lookup_dir: "../MIMIC_data/hosp"
+  vocab_path: "../EHR-JEPA-Data/vocab.json"
+  labels_base_dir: "../EHR-JEPA-Data/labels"
   labels_task: "icu_mortality"
-  cache_dir: "/home/ag619/EHR-JEPA-Data/cache"
+  cache_dir: "../EHR-JEPA-Data/cache"
 
 wandb:
   enabled: true
@@ -19,13 +19,13 @@ wandb:
   entity: null
 
 normalizer:
-  stats_path: "/home/ag619/EHR-JEPA-Data/normalizer_stats.json"
+  stats_path: "../EHR-JEPA-Data/normalizer_stats.json"
 
 model:
   d_model: 256
   embedding_type: "learned"
   text_encoder: "emilyalsentzer/Bio_ClinicalBERT"
-  code_embeddings_path: "/home/ag619/EHR-JEPA-Data/code_embeddings.pt"
+  code_embeddings_path: "../EHR-JEPA-Data/code_embeddings.pt"
   encoder_hidden_dim: 256
   vocab_size: 5000
   use_value: true
@@ -71,7 +71,7 @@ training:
 
   n_epochs: 20
 
-  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/bert_checkpoints/6_layer_256"
+  checkpoint_dir: "../EHR-JEPA-Data/bert_checkpoints/6_layer_256"
 
 # ---------------------------------------------------------------------------
 # Inline downstream evaluation — same structure as ehr_config.yaml

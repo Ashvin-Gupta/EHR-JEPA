@@ -85,8 +85,11 @@ from evaluation.downstream_dataset import DownstreamDataset
 # ---------------------------------------------------------------------------
 
 def load_config(path: str) -> dict:
+    from paths import resolve_config_paths
+
     with open(path) as f:
-        return yaml.safe_load(f)
+        cfg = yaml.safe_load(f)
+    return resolve_config_paths(cfg)
 
 
 def set_seed(seed: int | None, *, cudnn_benchmark: bool = False) -> None:

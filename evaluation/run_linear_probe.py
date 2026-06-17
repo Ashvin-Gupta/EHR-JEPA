@@ -39,7 +39,6 @@ import os
 import sys
 
 import torch
-import yaml
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if ROOT not in sys.path:
@@ -57,7 +56,7 @@ from evaluation.linear_probe import (
 )
 from models.sequence_pooling import get_eval_pooling
 from evaluation.downstream_dataset import DownstreamDataset
-from main import build_model, _ensure_vocab, _ensure_normalizer
+from main import build_model, _ensure_vocab, _ensure_normalizer, load_config
 
 
 # ---------------------------------------------------------------------------
@@ -129,11 +128,11 @@ def main() -> None:
                         help="Path to save trained probe weights")
     args = parser.parse_args()
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config(args.config)
 
     if args.data_dir:
-        cfg["data"]["data_dir"] = args.data_dir
+        from paths import resolve_path
+        cfg["data"]["data_dir"] = resolve_path(args.data_dir)
 
     # ---- Artefacts ----
     vocab: Vocab | None = None

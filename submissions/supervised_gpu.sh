@@ -16,13 +16,12 @@
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
 #SBATCH --gres=gpu:1
-#SBATCH --output=/home/ag619/EHR-JEPA/logs/Supervised/%x_%j.log
+#SBATCH --output=logs/Supervised/%x_%j.log
 #SBATCH --job-name=sup-JEPA
 
 set -e
 
-# Set the base directory for your project
-BASE_DIR="/home/ag619/EHR-JEPA"
+source "$(dirname "${BASH_SOURCE[0]}")/common.sh"
 
 export WANDB_API_KEY="3256683a0a9a004cf52e04107a3071099a53038e"
 
@@ -32,13 +31,11 @@ cd "${BASE_DIR}"
 echo "Activating virtual environment..."
 source .venv/bin/activate
 
-
-export PYTHONPATH="${BASE_DIR}:${PYTHONPATH}"
 # Disable Python output buffering so the log file updates in real-time
 export PYTHONUNBUFFERED=1
 
 TASK="${1:-}"
-CHECKPOINT="${2:-/home/ag619/EHR-JEPA-Data/Fri22ndMaycausal_single/checkpoints/last.pt}"
+CHECKPOINT="${2:-${DATA_DIR}/Fri22ndMaycausal_single/checkpoints/last.pt}"
 
 echo "Job ID:   ${SLURM_JOB_ID}"
 echo "Log file: logs/Supervised/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"

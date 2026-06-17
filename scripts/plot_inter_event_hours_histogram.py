@@ -34,10 +34,9 @@ from data.meds_parser import _sorted_parquet_files
 
 
 def _load_config_data_dir(config_path: str) -> str:
-    import yaml
+    from main import load_config
 
-    with open(config_path, encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    cfg = load_config(config_path)
     d = cfg.get("data", {}).get("data_dir")
     if not d:
         raise SystemExit(f"No data.data_dir in {config_path}")
