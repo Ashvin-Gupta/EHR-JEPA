@@ -43,7 +43,7 @@ echo "Log file: logs/Supervised/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
 
 PYTHON_ARGS=(
   --config configs/bert_config.yaml
-  --checkpoint /home/ag619/EHR-JEPA-Data/bert_checkpoints/6_layer_1024/best.pt
+  --checkpoint /home/ag619/EHR-JEPA-Data/bert_checkpoints/6_layer_256/best.pt
 )
 if [[ -n "${TASK}" ]]; then
   PYTHON_ARGS+=(--task "${TASK}")

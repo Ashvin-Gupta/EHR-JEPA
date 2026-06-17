@@ -21,16 +21,29 @@ source .venv/bin/activate
 export PYTHONPATH="${BASE_DIR}:${PYTHONPATH}"
 export PYTHONUNBUFFERED=1
 
+RESUME_FROM="${1:-}"
+
 echo "Job ID:   ${SLURM_JOB_ID}"
 echo "Log file: logs/Pretrain/${SLURM_JOB_NAME}_${SLURM_JOB_ID}.log"
 echo "GPUs:     ${SLURM_GPUS_ON_NODE:-4}"
 
+if [[ -n "${RESUME_FROM}" ]]; then
+    echo "Resume:   ${RESUME_FROM}"
+else
+    echo "Resume:   from config (training.resume_from / auto_resume_last)"
+fi
+
 # torchrun spawns one process per GPU on this node.
 # MASTER_ADDR/PORT are set automatically by SLURM when --nodes=1.
+PY_ARGS=(main.py --config configs/ehr_config.yaml)
+if [[ -n "${RESUME_FROM}" ]]; then
+    PY_ARGS+=(--resume-from "${RESUME_FROM}")
+fi
+
 torchrun \
     --standalone \
     --nproc_per_node=4 \
-    main.py --config configs/ehr_config.yaml
+    "${PY_ARGS[@]}"
 
 echo "Pretrain finished."
 

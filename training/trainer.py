@@ -261,6 +261,8 @@ class TrainerConfig:
     # {checkpoint_dir}/best.pt.  End-of-training model saved to
     # {checkpoint_dir}/last.pt.
     checkpoint_dir: str = ""
+    # Save full numbered checkpoints every N epochs (0 = disabled).
+    checkpoint_every_n_epochs: int = 0
 
     # General
     n_epochs: int = 10
@@ -2062,6 +2064,7 @@ class JEPATrainer(nn.Module):
         train_sampler = None,
         rank: int = 0,
         world_size: int = 1,
+        resume_state: Optional[Dict[str, float]] = None,
     ) -> Dict[str, List[float]]:
         """
         Training loop with LR scheduling, gradient clipping, and early stopping.
@@ -2113,12 +2116,31 @@ class JEPATrainer(nn.Module):
         best_probe_auroc   = -float("inf")  # tracks best probe val_auroc for probe_best.pt
         patience_left      = cfg.early_stopping_patience
         stopped_early      = False
+        start_epoch        = 0
 
         # Set up checkpoint directory once so the path is always available
         ckpt_dir = cfg.checkpoint_dir.strip() if cfg.checkpoint_dir else ""
         if ckpt_dir and is_main_process:
             os.makedirs(ckpt_dir, exist_ok=True)
             print(f"[train] Checkpoints:     {ckpt_dir}")
+
+        if resume_state is not None:
+            start_epoch = int(resume_state.get("start_epoch", 0))
+            global_step = int(resume_state.get("global_step", 0))
+            best_metric = float(resume_state.get("best_metric", best_metric))
+            best_ckpt_metric = float(resume_state.get("best_ckpt_metric", best_ckpt_metric))
+            best_probe_auroc = float(resume_state.get("best_probe_auroc", best_probe_auroc))
+            patience_left = int(resume_state.get("patience_left", patience_left))
+            scheduler_state = resume_state.get("scheduler_state")
+            if scheduler is not None and scheduler_state is not None:
+                scheduler.load_state_dict(scheduler_state)
+            if is_main_process:
+                print(
+                    f"[train] Resuming at epoch {start_epoch + 1}/{cfg.n_epochs} "
+                    f"(global_step={global_step})"
+                )
+        else:
+            global_step = 0
 
         use_amp = cfg.use_amp and device.type == "cuda"
         amp_dtype = (
@@ -2152,8 +2174,7 @@ class JEPATrainer(nn.Module):
             print(f"[train] W&B batch log:   every {log_every} step(s)")
             print()
 
-        global_step = 0
-        for epoch in range(cfg.n_epochs):
+        for epoch in range(start_epoch, cfg.n_epochs):
             # Reshuffle each rank's data slice independently each epoch
             if train_sampler is not None:
                 train_sampler.set_epoch(epoch)
@@ -2416,9 +2437,19 @@ class JEPATrainer(nn.Module):
                     "train_loss":   avg_train,
                     "model_state":  self.state_dict(),
                     "optimizer_state": optimizer.state_dict(),
+                    "scheduler_state": scheduler.state_dict() if scheduler is not None else None,
+                    "best_metric": best_metric,
+                    "best_ckpt_metric": best_ckpt_metric,
+                    "best_probe_auroc": best_probe_auroc,
+                    "patience_left": patience_left,
                 }
                 torch.save(ckpt_payload, os.path.join(ckpt_dir, "last.pt"))
                 save_jepa_split_checkpoints(ckpt_payload["model_state"], ckpt_dir)
+                save_every = int(cfg.checkpoint_every_n_epochs)
+                if save_every > 0 and (epoch + 1) % save_every == 0:
+                    ep_name = f"epoch_{epoch + 1:03d}.pt"
+                    torch.save(ckpt_payload, os.path.join(ckpt_dir, ep_name))
+                    print(f"  [ckpt] Saved {ep_name}")
                 if ckpt_monitor < best_ckpt_metric:
                     best_ckpt_metric = ckpt_monitor
                     torch.save(ckpt_payload, os.path.join(ckpt_dir, "best.pt"))

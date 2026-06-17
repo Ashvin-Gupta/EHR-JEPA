@@ -325,6 +325,7 @@ def build_model(cfg: dict, vocab: Vocab | None) -> JEPATrainer:
         debug_jepa_every_n_steps=int(tr.get("debug_jepa_every_n_steps", 0)),
         debug_jepa_on_zero_loss=bool(tr.get("debug_jepa_on_zero_loss", True)),
         checkpoint_dir=tr.get("checkpoint_dir", ""),
+        checkpoint_every_n_epochs=int(tr.get("checkpoint_every_n_epochs", 0)),
         n_epochs=tr.get("n_epochs", 10),
         device="cuda" if torch.cuda.is_available() else "cpu",
     )
@@ -830,7 +831,11 @@ def _run_final_probe_test(
 # Main
 # ---------------------------------------------------------------------------
 
-def main(config_path: str, no_wandb: bool = False) -> None:
+def main(
+    config_path: str,
+    no_wandb: bool = False,
+    resume_from_cli: str | None = None,
+) -> None:
     # 0a. DDP initialisation — must happen before any CUDA calls
     rank, local_rank, world_size, is_ddp = _init_ddp()
     is_main = (rank == 0)   # only rank 0 does I/O, logging, checkpointing
@@ -1007,6 +1012,36 @@ def main(config_path: str, no_wandb: bool = False) -> None:
     if is_main:
         print("[train] Starting training loop …")
     ds_cfg = cfg.get("downstream", {})
+    ckpt_cfg_dir = trainer.config.checkpoint_dir.strip() if trainer.config.checkpoint_dir else ""
+    resume_from = (resume_from_cli or "").strip()
+    if not resume_from:
+        resume_from = str(cfg.get("training", {}).get("resume_from", "") or "").strip()
+    auto_resume_last = bool(cfg.get("training", {}).get("auto_resume_last", False))
+    if not resume_from and auto_resume_last and ckpt_cfg_dir:
+        auto_last = os.path.join(ckpt_cfg_dir, "last.pt")
+        if os.path.exists(auto_last):
+            resume_from = auto_last
+
+    resume_state = None
+    if resume_from:
+        if not os.path.exists(resume_from):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_from}")
+        if is_main:
+            print(f"[train] Loading resume checkpoint: {resume_from}")
+        ckpt = torch.load(resume_from, map_location="cpu")
+        trainer.load_state_dict(ckpt["model_state"])
+        if "optimizer_state" in ckpt:
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+        resume_state = {
+            "start_epoch": int(ckpt.get("epoch", 0)),
+            "global_step": int(ckpt.get("global_step", 0)),
+            "best_metric": float(ckpt.get("best_metric", float("inf"))),
+            "best_ckpt_metric": float(ckpt.get("best_ckpt_metric", float("inf"))),
+            "best_probe_auroc": float(ckpt.get("best_probe_auroc", -float("inf"))),
+            "patience_left": int(ckpt.get("patience_left", trainer.config.early_stopping_patience)),
+            "scheduler_state": ckpt.get("scheduler_state"),
+        }
+
     history = trainer.train_loop(
         train_loader=train_loader,
         val_loader=val_loader,
@@ -1025,6 +1060,7 @@ def main(config_path: str, no_wandb: bool = False) -> None:
         train_sampler=train_sampler,
         rank=rank,
         world_size=world_size,
+        resume_state=resume_state,
     )
 
     # 10. Summary (rank 0 only)
@@ -1073,5 +1109,14 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable W&B logging for this run",
     )
+    parser.add_argument(
+        "--resume-from",
+        default=None,
+        help="Path to checkpoint .pt to resume from (typically .../last.pt)",
+    )
     args = parser.parse_args()
-    main(args.config, no_wandb=args.no_wandb)
+    main(
+        args.config,
+        no_wandb=args.no_wandb,
+        resume_from_cli=args.resume_from,
+    )

@@ -137,13 +137,13 @@ loss:
   # L_total = L_pred + lambda_cov * SIGReg(Z_tgt).  SIGReg is typically O(1);
   # lambda_cov >> 1 (e.g. 100) with grad_clip disabled often blows up weights → NaN.
   # Safer starting range: 0.05–1.0; enable training.grad_clip (e.g. 1.0) if unstable.
-  lambda_cov: 0.68 #masking for 0.1 of pred loss
+  lambda_cov: 0.1 #masking for 0.1 of pred loss
   # Branch B + causal_* masking: per-target-token (vectorized on GPU)
   #   W = max(floor, exp(-future_time_decay_lambda * delta_minutes_since_cut))
   # delta_minutes = wall-clock minutes from cut t to each future event.
   # Replaces hard future_max_events / future_max_hours caps on the target window.
   # 0 = plain unweighted MSE.  Typical lambda: 0.01–0.1 (1/min).
-  future_time_decay_lambda: 0.0462
+  future_time_decay_lambda: 0.00289
   future_time_decay_weight_floor: 0.05
   # SIGReg: number of random 1D projections per forward (no linear proj dim).
   sigreg_num_slices: 32
@@ -219,11 +219,17 @@ training:
   debug_jepa_every_n_steps: 200
   debug_jepa_on_zero_loss: true
 
-  n_epochs: 20
+  n_epochs: 200
 
   # Directory where best.pt and last.pt checkpoints are written.
   # Set to "" or omit to disable checkpointing.
-  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/Fri22ndMaycausal_single3/checkpoints"
+  checkpoint_dir: "/home/ag619/EHR-JEPA-Data/Wed27thMaycausal_causal_single/checkpoints"
+  # Save fixed-time snapshots for later linear-probe analysis.
+  checkpoint_every_n_epochs: 20
+  # Optional explicit checkpoint path to resume from.
+  resume_from: ""
+  # If true and resume_from is empty, automatically resume from checkpoint_dir/last.pt.
+  auto_resume_last: true
 
 # ---------------------------------------------------------------------------
 # Inline downstream evaluation
@@ -232,11 +238,11 @@ training:
 # ---------------------------------------------------------------------------
 downstream:
   # Set to true to enable.  Requires data.labels_base_dir and data.labels_task.
-  enabled: false
+  enabled: true
 
   # When false, skip inline linear probe during pretrain even if loaders exist
   # (pretrain-only; final probe test still runs if loaders are built).
-  inline_probe_during_pretrain: false
+  inline_probe_during_pretrain: true
 
   # Number of epochs to train the linear probe each time it runs.
   probe_epochs: 6
@@ -263,7 +269,7 @@ downstream:
   probe_max_files: 5
   # Run the inline probe every N epochs (epoch 1 always runs regardless).
   # Set to 1 to probe every epoch; set to e.g. 2 to probe every other epoch.
-  probe_interval: 5
+  probe_interval: 10
 
 # Standalone supervised evaluation (python main_supervised_downstream.py --config ...)
 # Typical workflow: three separate jobs — (1) pretrain with main.py / torchrun,
@@ -280,7 +286,7 @@ downstream_eval:
   # Sequence pooling for token JEPA / BERT (ignored when predictor.use_perceiver):
   #   cls       — [CLS] token
   #   mean_pool — masked mean over event tokens
-  pooling: mean_pool
+  pooling: cls
 
   # Classification head on top of pooled (JEPA) or CLS (BERT) features:
   #   linear — Dropout → Linear(d_total → 1)
@@ -300,7 +306,7 @@ downstream_eval:
   n_epochs: 20
   lr: 1.0e-4
   weight_decay: 0.05         # AdamW L2 — helps when train AUROC >> val AUROC
-  batch_size: 1024
+  batch_size: 128
 
   # --- Anti-overfitting (supervised finetune) ---
   # Stop if val AUROC does not improve for this many epochs (0 = run all n_epochs).
